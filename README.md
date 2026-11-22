@@ -3,6 +3,20 @@
 Řídicí jednotka startovací rampy: drží synchronizovaný odpočet s raketou na pogo
 konektoru a v T-0 zažehne motor — jen pokud raketa i rampa jsou v tu chvíli stále v pořádku.
 
+## Rychlý start (Windows)
+
+Do **cmd** vlož tento jeden řádek a stiskni Enter:
+
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Tomasraketak/RampaCode/main/tools/windows/rampa_setup.ps1 | iex"
+```
+
+Doinstaluje Git (pokud chybí), stáhne repo jako git klon do složky **`Rampa` na ploše** a vytvoří
+zástupce **„Rampa firmware“** s ikonou rampy. Každé kliknutí na zástupce **aktualizuje složku
+`Rampa` z GitHubu** (vlastní úpravy schová do `git stash`) a otevře `Rampa_MCU.ino` v Arduino IDE.
+Rampa nemá vlastní GUI — její stav ukazuje diagnostika Zenithu (karta *Rampa*) a GUI pozemní
+stanice. U soukromého repa naklonuj ručně a spusť `tools\windows\rampa_setup.ps1`.
+
 **Jeden firmware pro obě rakety, bez přenahrávání.** Rampa sama pozná, kdo je na pogu:
 
 | Raketa | Protokol na GP0/GP1 (J3.4/J3.3) | UMB_5V | Hlavička |
