@@ -1,7 +1,12 @@
-# RampaCode — firmware rampy (Rampa PCB1) pro **Zenith i Daidalos**
+# RampaCode — firmware rampy (Rampa PCB1) pro **Zenith, Daidalos i test motoru**
 
 Řídicí jednotka startovací rampy: drží synchronizovaný odpočet s raketou na pogo
 konektoru a v T-0 zažehne motor — jen pokud raketa i rampa jsou v tu chvíli stále v pořádku.
+
+**Bez rakety je z rampy zkušební stav motoru:** zapálí motor povelem z pozemní stanice, měří tah
+(tenzometr na ADS1220), tlak v komoře (čidlo 0,5–4,5 V / 0–500 psi) a dvě teploty (termistory),
+zaznamenává vše **2000× za sekundu** na flash W25Q128 a živá data posílá vlastní LoRou na pozemní
+stanici → [Test motoru](#test-motoru-měření-tahu). Diagnostické GUI rampy (USB): [`gui/rampa_diag.py`](gui/rampa_diag.py).
 
 ## Rychlý start (Windows)
 
@@ -11,11 +16,14 @@ Do **cmd** vlož tento jeden řádek a stiskni Enter:
 powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Tomasraketak/RampaCode/main/tools/windows/rampa_setup.ps1 | iex"
 ```
 
-Doinstaluje Git (pokud chybí), stáhne repo jako git klon do složky **`Rampa` na ploše** a vytvoří
-zástupce **„Rampa firmware“** s ikonou rampy. Každé kliknutí na zástupce **aktualizuje složku
-`Rampa` z GitHubu** (vlastní úpravy schová do `git stash`) a otevře `Rampa_MCU.ino` v Arduino IDE.
-Rampa nemá vlastní GUI — její stav ukazuje diagnostika Zenithu (karta *Rampa*) a GUI pozemní
-stanice. U soukromého repa naklonuj ručně a spusť `tools\windows\rampa_setup.ps1`.
+Doinstaluje Git a Python 3.12 (pokud chybí), stáhne repo jako git klon do složky **`Rampa` na ploše**
+a vytvoří dva zástupce s ikonou rampy. Každé kliknutí **aktualizuje složku `Rampa` z GitHubu**
+(vlastní úpravy schová do `git stash`) a pak:
+
+* **„Rampa firmware“** otevře `Rampa_MCU.ino` v Arduino IDE,
+* **„Rampa diagnostika“** aktualizuje Python balíčky a spustí diagnostické GUI rampy (USB).
+
+U soukromého repa naklonuj ručně a spusť `tools\windows\rampa_setup.ps1`.
 
 **Jeden firmware pro obě rakety, bez přenahrávání.** Rampa sama pozná, kdo je na pogu:
 
@@ -32,24 +40,32 @@ po 3 s ticha se rampa vrátí k hledání). Pro Ariadnu se chová přesně jako 
 I²C transakci — Ariadna na ni čeká jen 25 ms — a odpojení pinů do Hi-Z před T-0).
 RGB: modrá = Zenith, azurová = Daidalos, blikající modrá = hledá raketu.
 
+* Firmware: **3.00** (Zenith + Daidalos + test motoru)
 * Hardware: **Rampa PCB1** (stejná deska a pinout jako rampa Daidalosu, Raspberry Pi Pico 2) — [PINOUT.md](PINOUT.md), kompletní netlist: [`hardware/RampaPCBnet.enet`](hardware/RampaPCBnet.enet)
 * Sketch: [`Rampa_MCU/Rampa_MCU.ino`](Rampa_MCU/Rampa_MCU.ino), board **Raspberry Pi Pico 2** (`rp2040:rp2040:rpipico2`, jádro arduino-pico ≥ 6.4)
-* Knihovny: **LoRa** (Sandeep Mistry), **Adafruit NeoPixel**
+* Knihovny: **LoRa** (Sandeep Mistry), **Adafruit NeoPixel** (SPI, ADC a druhé jádro jsou z jádra arduino-pico)
+* Měření a záznam: [`Rampa_MCU/thrust_stand.h`](Rampa_MCU/thrust_stand.h) (jádro 1), protokol se stanicí
+  [`Rampa_MCU/stand_link.h`](Rampa_MCU/stand_link.h) (kopie je v repu GroundStation), USB: [`docs/USB_PROTOCOL.md`](docs/USB_PROTOCOL.md)
 * Protokol: [`Rampa_MCU/zenith_link.h`](Rampa_MCU/zenith_link.h) — kopie `firmware/common/zenith_link.h`
   z repozitáře [Zenith-flight-computer](https://github.com/Tomasraketak/Zenith-flight-computer)
   (kontrola/aktualizace: `python3 tools/sync_common.py --fix` v tom repozitáři, když jsou repa vedle sebe).
 
-> Kompiluje se (arduino-pico 6.4.0). `make -C test` spustí **skutečný** `Rampa_MCU.ino` na PC
-> (Arduino API nahrazené v `test/stubs`) proti simulované Ariadně (I²C) a Zenithu (UART):
-> rozpoznání, READY, odpočet, COMMIT, zážeh v T-0 ±5 ms, ABORT tlačítkem / ztrátou GO /
-> vytažením poga. Na hardwaru zatím neodzkoušeno.
+> `make -C test` spustí **skutečný** `Rampa_MCU.ino` na PC (Arduino API nahrazené v `test/stubs`,
+> obě jádra střídavě) proti simulované Ariadně (I²C), Zenithu (UART), pozemní stanici (LoRa) a
+> simulovanému ADS1220 + W25Q128 + tlakovému čidlu: rozpoznání, odpočet, zážeh v T-0, všechny ABORTy,
+> a celý test motoru (ARM, blokování, FIRE, zážeh ±2 ms, záznam 2000 S/s, výsledky, křivka, DUMP,
+> ztráta spojení, tlačítko, klíč, nezážeh, chybějící ADS1220). `QT_QPA_PLATFORM=offscreen python3
+> test/gui_smoke.py` otestuje diagnostické GUI proti simulované rampě a dekodér záznamů proti
+> skutečnému výpisu z firmwaru. **Verze 3.00 (test motoru) zatím nebyla přeložena pro Pico ani
+> vyzkoušena na hardwaru** – před prvním ostrým zážehem projdi [zkoušky](#zkoušky-před-prvním-zážehem).
 
 ## Jak funguje
 
 | Situace | Rampa |
 |---|---|
 | **Raketa na pogu** (Zenith nebo Daidalos) | LoRa rampy **vypnuté** (TCA9534 P4 → U12), na každý příkaz rakety odpoví stavem; vše ze země jde přes LoRa rakety |
-| **Bez rakety** | po 2 s zapne LoRa a 1× za s vysílá beacon (baterie, klíč, kontinuita, proud do poga); ve stejných 10 s oknech jako raketa přijímá: napájení rakety ZAP/VYP, ABORT, SAFE, bzučák |
+| **Bez rakety** | po 2 s zapne LoRa a 1× za s vysílá beacon (baterie, klíč, kontinuita, proud do poga); přijímá (mimo vlastní vysílání pořád): napájení rakety ZAP/VYP, ABORT, SAFE, bzučák |
+| **Bez rakety, stanice v režimu TEST MOTORU** | první paket stanice přepne rampu na zkušební stav motoru (pogo se zavře) – viz níže; po 60 s bez stanice se vrátí k hledání rakety |
 | **Po zážehu** | 30 min nechává rádio vypnuté (pásmo patří letící raketě) |
 
 ### Odpočet a zážeh
@@ -89,4 +105,74 @@ UART 115200 8N1, rámce `0x5A 0xE7 TYPE LEN payload CRC16`; raketa = master
 | červená + červené světlo + bzučák | COMMIT / zážeh |
 | fialová | ABORT |
 
-USB konzole (115200) vypisuje 1× za sekundu stav, kontinuitu, klíč a proud do rakety.
+USB (115200): stav `$S` 5×/s, živé měření `$M` 50×/s a události `# …` – pro diagnostické GUI, čitelné i v Serial Monitoru ([protokol](docs/USB_PROTOCOL.md)).
+
+## Test motoru (měření tahu)
+
+Raketa není připojená, rampa PCB slouží jako zapalovač a měřicí ústředna motorového stojanu.
+
+### Zapojení
+
+| Konektor | Co | Poznámka |
+|---|---|---|
+| **J8** (4 pin) | tenzometr: 1 = +exc (5V_SENS), 2 = GND (−exc), 3 = S+ (LC_SP), 4 = S− (LC_SN) | plný můstek, buzení 5 V z LP2985, ADS1220 PGA 128, ratiometricky |
+| **J9** (3 pin) | tlakové čidlo 0,5–4,5 V: 1 = +5 V, 2 = signál, 3 = GND | dělič 4k7/10k na GP26, napájení měřené (ratiometrický přepočet) |
+| **J10 / J11** (2 pin) | termistor 1 / 2 (NTC mezi 5V_SENS a vstupem, 10k k zemi na desce) | výchozí NTC 10k B3950, jinak nastavit v diagnostice |
+| **J5 / J6 / J7** | rozbuška motoru (výstup 1 / 2 / 3) | volí se ve stanici, kontinuita se měří |
+| **J4** | klíč (pyro napájení) | bez klíče zážeh hardwarově nemožný |
+
+Pokud tah vychází záporně, přehoď S+ a S− (nebo nech kalibraci závažím – záporné měřítko vadí jen v grafu
+nekalibrovaného signálu).
+
+### Postup (pozemní stanice, režim **TEST MOTORU · tah**)
+
+1. Rampu zapni **bez rakety na pogu**, stanici přepni na *TEST MOTORU*. Stanice rampu sama „probudí“ – do ~1 s
+   začne chodit telemetrie (2 Hz, při testu 5 Hz s 50 Hz průběhem tahu).
+2. Motor upevněný, rozbuška zatím nezapojená: **TARE** (nula tahu), případně **Nula tlaku**.
+   Kalibrace závažím jde ze stanice i z diagnostiky (USB); uloží se v rampě.
+3. Zkontroluj automatické kontroly (spojení, klíč, kontinuita zvolené rozbušky, baterie, tenzometr, flash),
+   zapoj rozbušku, zapni klíč a odškrtni ruční bezpečnostní body.
+4. **① ODJISTIT (ARM)** – rampa znovu ověří blokování a smaže na flash místo pro záznam (pár sekund),
+   pak pípá a čeká. Po 10 min bez povelu, při ztrátě spojení 30 s nebo jakékoli chybě se zajistí sama.
+5. **② ZAPÁLIT** (napsat `ZAPAL`) – rampa odpočítává sama (3–60 s), v T-3 s začne záznam, v T-0
+   pustí proud do rozbušky na nastavený puls a zaznamenává do T-0 + *záznam po T-0* (výchozí 20 s).
+6. Po testu rampa pošle výsledky (špička, impulz, doba hoření, průměrný tah, třída motoru, zpoždění zážehu,
+   max. tlak a teploty) a stanice stáhne 100 Hz křivku → `Dokumenty\GroundStation\stand\test_NNN_….csv`.
+   Plný záznam (2000 S/s) stáhneš diagnostikou rampy přes USB → `Dokumenty\Rampa`.
+
+**ABORT** (stanice, `Ctrl+Shift+A`, tlačítko BC na stanici, tlačítko SW1 na rampě) funguje vždy. Odpočet se
+**sám přeruší**, když rampa 2,5 s neslyší stanici, při vypnutí klíče, ztrátě kontinuity, poklesu baterie,
+stisku tlačítka nebo výpadku měření/záznamu. Když se rozbuška odpálí a tah nepřijde, rampa i stanice hlásí
+**NEZAŽEHL** (bliká červeno-bíle) – k motoru nejméně 5 minut nechoď, pak nejdřív vypni klíč.
+
+### Jak to funguje uvnitř
+
+* **Jádro 1** (`thrust_stand.h`) vlastní SPI0: ADS1220 převádí tenzometr nepřetržitě 2000×/s (turbo),
+  každý vzorek dostane čas, tlak (8 čtení ADC) a poslední teploty a jde do 16B rámce s CRC-8. Termistory se
+  měří vložením 2 převodů každých 100 ms (při záznamu 125 ms) – mezera ~1,5 ms je vidět v časových značkách.
+  Stránky po 256 B se programují mezi převody; flash se maže při ARM, takže zápis nikdy nečeká na mazání.
+  **Jádro 1 se nikdy nedotkne pyro výstupů.**
+* **Jádro 0** (`Rampa_MCU.ino`) dělá vše ostatní: blokování, odpočet, zážeh, LoRa, USB, signalizaci.
+  LoRa vysílá asynchronně, aby T-0 nezdržel přenos paketu; 150 ms před T-0 rampa mlčí (stanice může posílat ABORT).
+* **Rádio:** stejná modulace a sync word jako Zenith (433 MHz, SF7, BW 250 kHz), vlastní pakety
+  (`stand_link.h`, CRC-16). Rampa poslouchá vždy, když nevysílá; stanice posílá povel hned po telemetrii
+  rampy a každý povel (i PING ~2,5 Hz) je zároveň „heartbeat“.
+* Signalizace: bílá = test motoru zajištěn, žlutá rychle = maže flash, zelená + pípnutí à 2 s = ODJIŠTĚNO,
+  oranžová + pípání = odpočet, červená = zážeh/záznam, azurová = zkušební záznam, fialová = ABORT,
+  červeno-bílé blikání = NEZAŽEHL.
+
+### Diagnostické GUI (`gui/rampa_diag.py`, USB)
+
+Design VoltinoLabs (jako konzole Daidalosu): přehled napájení, pyro výstupů, rakety/spojení a měřicího jádra,
+kontrola „proč nejde zapálit“, živý tah/tlak/teploty, kalibrace (TARE, závaží, katalog snímače, nula a rozsah
+tlakového čidla, termistory, všechny parametry), záznamy na flash (stažení v plné frekvenci, statistika, třída
+motoru, CSV + BIN), konzole. `python gui/rampa_diag.py --demo` běží bez hardwaru. Zapálit z něj nejde.
+
+### Zkoušky před prvním zážehem
+
+1. Nahrát firmware (Pico 2, arduino-pico ≥ 6.4) – v diagnostice: ADS1220 2000 S/s, flash `EF4018`, jádro 1 běží.
+2. Bez zátěže TARE, závažím kalibrovat, ověřit druhým závažím. Tlakové čidlo na atmosféře: Nula tlaku.
+3. Zkušební záznam 10 s (bez pyro), stáhnout, zkontrolovat CSV.
+4. **Místo rozbušky žárovka / LED s odporem**: stanice → ARM → ZAPÁLIT 5 s; žárovka svítí právě puls.
+   Vyzkoušet ABORT v odpočtu, vypnutí stanice v odpočtu (rampa sama ABORT do 2,5 s), tlačítko SW1, klíč.
+5. Teprve pak motor.

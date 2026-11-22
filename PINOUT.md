@@ -23,7 +23,13 @@ rampa_pcb1: # Raspberry Pi Pico 2 (U7), sketch Rampa_MCU/Rampa_MCU.ino
   lora:            {spi1: {sck: GP10, mosi: GP11, miso: GP12, cs: GP13}, ic: "M1 Ra-02 SX1278 433 MHz",
                     rst: "TCA9534 P3", power: "TCA9534 P4"}
   rgb:             "GP20 SK6812 (R56)"
-  unused_by_fw:    {spi0_flash_ads1220: "GP2-GP5, GP15, GP21", servos: "GP8 GP9 GP14 GP22", pressure_adc: GP26, umb2: "GP27 GP28"}
+  spi0_measure:    {sck: GP2, mosi: GP3, miso: GP4, flash_cs: "GP5 (U9 W25Q128, R17 PU)", ads_cs: "GP15 (U14 ADS1220, R59 PU)",
+                    ads_drdy: GP21, owner: "core 1 (thrust_stand.h)"}
+  ads1220_U14:     {AIN1_AIN0: "load cell J8 (LC_SP via R73 1k / LC_SN via R74 1k, C49 10n diff)", AIN2: "THERM1 J10 (R48 10k to GND)",
+                    AIN3: "THERM2 J11 (R49 10k to GND)", REFP0_AVDD: "5V_SENS (excitation, ratiometric)", clk: internal}
+  pressure_adc:    {pin: "GP26 / ADC0", net: PRESSURE, from: "J9.2 via R46 4k7, R47 10k to GND (x0.680), D6A/D6B clamp, C38 47n",
+                    supply: "J9.1 = 5V_SENS (measured on ADS1115 AIN3 = 5V_SENS/2)"}
+  unused_by_fw:    {servos: "GP27 (J12.1), GP28 (J12.4), GP14 (J12.7), GP22 (J12.10)", umb2_uart1: "GP8 TX / GP9 RX (J14)"}
 ```
 
 | Pin | Funkce | Síť / periférie |
@@ -35,5 +41,11 @@ rampa_pcb1: # Raspberry Pi Pico 2 (U7), sketch Rampa_MCU/Rampa_MCU.ino
 | GP16 / GP17 / GP18 | zážeh kanálu 1 / 2 / 3 | Q22 / Q23 / Q24 → J5 / J6 / J7 |
 | GP19 | ARM | Q21 → Q20 (VPYRO_ARMED) |
 | GP20 | RGB | SK6812 |
+| GP2 / GP3 / GP4 | SPI0 SCK / MOSI / MISO | ADS1220 (U14) + W25Q128 (U9), jádro 1 |
+| GP5 | CS flash | W25Q128 (záznamy testů, konfigurace) |
+| GP15 / GP21 | CS / DRDY ADS1220 | tenzometr J8, termistory J10 / J11 |
+| GP26 | ADC0 | tlakové čidlo J9 (dělič 4k7 / 10k) |
+| GP8 / GP9 | UART1 (druhé pogo J14) | firmware nepoužívá |
+| GP27 / GP28 / GP14 / GP22 | serva J12 | firmware nepoužívá |
 
 Zážeh vyžaduje současně: klíč J4 sepnutý + GP19 HIGH + GPx HIGH.
