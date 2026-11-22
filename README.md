@@ -32,7 +32,7 @@ po 3 s ticha se rampa vrátí k hledání). Pro Ariadnu se chová přesně jako 
 I²C transakci — Ariadna na ni čeká jen 25 ms — a odpojení pinů do Hi-Z před T-0).
 RGB: modrá = Zenith, azurová = Daidalos, blikající modrá = hledá raketu.
 
-* Hardware: **Rampa PCB1** (stejná deska a pinout jako rampa Daidalosu, Raspberry Pi Pico 2) — [PINOUT.md](PINOUT.md)
+* Hardware: **Rampa PCB1** (stejná deska a pinout jako rampa Daidalosu, Raspberry Pi Pico 2) — [PINOUT.md](PINOUT.md), kompletní netlist: [`hardware/RampaPCBnet.enet`](hardware/RampaPCBnet.enet)
 * Sketch: [`Rampa_MCU/Rampa_MCU.ino`](Rampa_MCU/Rampa_MCU.ino), board **Raspberry Pi Pico 2** (`rp2040:rp2040:rpipico2`, jádro arduino-pico ≥ 6.4)
 * Knihovny: **LoRa** (Sandeep Mistry), **Adafruit NeoPixel**
 * Protokol: [`Rampa_MCU/zenith_link.h`](Rampa_MCU/zenith_link.h) — kopie `firmware/common/zenith_link.h`

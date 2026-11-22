@@ -1,6 +1,7 @@
 # Rampa PCB1 — pinout (RampaNetlist_PCB1_2026-11-19)
 
-Stejná deska jako rampa Daidalosu. Pogo umbilical (J3) je podle připojené rakety buď
+Stejná deska jako rampa Daidalosu. Kompletní netlist PCB (EasyEDA JSON): [`hardware/RampaPCBnet.enet`](hardware/RampaPCBnet.enet).
+Pogo umbilical (J3) je podle připojené rakety buď
 **UART0** (Zenith: GP0 = TX, GP1 = RX) nebo **I²C0 slave 0x2B** (Daidalos/Ariadna: GP0 = SDA,
 GP1 = SCL) — RP2350 má na těchto pinech obojí a firmware přepíná sám.
 
