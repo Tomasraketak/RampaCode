@@ -96,7 +96,7 @@ typedef struct {
 
 typedef struct {                // persisted configuration (calibration + test defaults)
     uint32_t magic;             // TS_CFG_MAGIC
-    uint16_t ver;               // 1
+    uint16_t ver;               // 2 (1 = before the arming servo; migrated on load)
     uint16_t seq;               // newer copy wins
     int32_t  lc_offset;         // tare, ADS codes
     float    lc_scale;          // N per code, 0 = not calibrated (force shown in uV/V)
@@ -115,13 +115,17 @@ typedef struct {                // persisted configuration (calibration + test d
     uint8_t  pyro_ch;           // default igniter
     uint8_t  rate_2k;           // 1 = 2000 SPS turbo, 0 = 1000 SPS
     uint16_t cd_s;              // default countdown (GUI hint)
-    uint8_t  _pad[2];
+    uint8_t  arm_servo;         // servo 1..4 that closes the remote arming switch, 0 = none (key alone)
+    uint8_t  _r;
+    uint16_t arm_us;            // arming servo pulse: switch closed
+    uint16_t safe_us;           // arming servo pulse: switch open
+    uint16_t arm_settle_ms;     // the key sense must close within this after the servo moved
     uint16_t crc;
 } ts_cfg_t;
 
 typedef struct {                // 128 B at record start
     uint32_t magic;             // TS_HDR_MAGIC
-    uint16_t ver;               // 1
+    uint16_t ver;               // 2 (cfg v2)
     uint16_t test_no;
     uint32_t blocks;            // 64 KB blocks reserved
     uint16_t sps;
@@ -268,20 +272,40 @@ static inline float ts_therm_c(const ts_cfg_t &c, float ratio)
 static void ts_cfg_defaults(ts_cfg_t &c)
 {
     memset(&c, 0, sizeof c);
-    c.magic = TS_CFG_MAGIC; c.ver = 1; c.seq = 0;
+    c.magic = TS_CFG_MAGIC; c.ver = 2; c.seq = 0;
     c.lc_offset = 0; c.lc_scale = 0.0f;
     c.p_zero = 0.10f; c.p_span = 0.80f; c.p_full_psi = 500.0f; c.adc_vref = 3.30f; c.p_div = 14.7f / 10.0f;
     c.th_r0 = 10000.0f; c.th_beta = 3950.0f; c.th_t0_c = 25.0f; c.th_rfix = 10000.0f;
     c.ign_thr_n = 2.0f;
     c.fire_ms = 1000; c.rec_s = 20; c.pyro_ch = 1; c.rate_2k = 1; c.cd_s = 10;
+    c.arm_servo = 0; c.arm_us = 2000; c.safe_us = 1000; c.arm_settle_ms = 1500;
 }
+static bool ts_servo_us_ok(uint16_t us) { return us >= 500 && us <= 2500; }
 static bool ts_cfg_valid(const ts_cfg_t &c)
 {
-    if (c.magic != TS_CFG_MAGIC || c.ver != 1) return false;
+    if (c.magic != TS_CFG_MAGIC || c.ver != 2) return false;
     if (sl_crc16((const uint8_t *)&c, sizeof c - 2) != c.crc) return false;
     return c.p_span > 0.01f && c.adc_vref > 1.0f && c.th_beta > 100.0f && c.th_rfix > 10.0f && c.th_r0 > 10.0f &&
            c.pyro_ch >= 1 && c.pyro_ch <= 3 && c.fire_ms >= SL_FIRE_MS_MIN && c.fire_ms <= SL_FIRE_MS_MAX &&
-           c.rec_s >= SL_REC_MIN_S && c.rec_s <= SL_REC_MAX_S;
+           c.rec_s >= SL_REC_MIN_S && c.rec_s <= SL_REC_MAX_S &&
+           c.arm_servo <= 4 && ts_servo_us_ok(c.arm_us) && ts_servo_us_ok(c.safe_us) &&
+           c.arm_settle_ms >= 200 && c.arm_settle_ms <= 10000;
+}
+/** A version-1 copy (68 B, before the arming servo): keep its calibration, add the servo defaults. */
+static bool ts_cfg_migrate_v1(const uint8_t *raw, ts_cfg_t &out)
+{
+    ts_cfg_t c;
+    memcpy(&c, raw, sizeof c);
+    const size_t v1 = 68;
+    if (c.magic != TS_CFG_MAGIC || c.ver != 1) return false;
+    if (sl_crc16(raw, v1 - 2) != (uint16_t)(raw[v1 - 2] | (raw[v1 - 1] << 8))) return false;
+    ts_cfg_t d; ts_cfg_defaults(d);
+    memcpy(&d, raw, offsetof(ts_cfg_t, arm_servo));      // everything up to cd_s is the same
+    d.ver = 2;
+    d.crc = sl_crc16((const uint8_t *)&d, sizeof d - 2);
+    if (!ts_cfg_valid(d)) return false;
+    out = d;
+    return true;
 }
 
 // =====================================================================
@@ -381,7 +405,9 @@ static void ts_cfg_load(void)
     ts_cfg_t a, b;
     fl_read(TS_CFG_A, (uint8_t *)&a, sizeof a);
     fl_read(TS_CFG_B, (uint8_t *)&b, sizeof b);
-    const bool va = ts_cfg_valid(a), vb = ts_cfg_valid(b);
+    bool va = ts_cfg_valid(a), vb = ts_cfg_valid(b);
+    if (!va) { uint8_t r[sizeof a]; memcpy(r, &a, sizeof r); va = ts_cfg_migrate_v1(r, a); }
+    if (!vb) { uint8_t r[sizeof b]; memcpy(r, &b, sizeof r); vb = ts_cfg_migrate_v1(r, b); }
     if (va && vb) ts_cfg = ((int16_t)(b.seq - a.seq) > 0) ? b : a;
     else if (va) ts_cfg = a;
     else if (vb) ts_cfg = b;
@@ -458,7 +484,7 @@ static void ts_rec_start_frames(void)
 {
     ts_hdr_t h;
     memset(&h, 0xFF, sizeof h);
-    h.magic = TS_HDR_MAGIC; h.ver = 1;
+    h.magic = TS_HDR_MAGIC; h.ver = 2;
     h.test_no = (uint16_t)(ts_test_no + 1);
     h.blocks = ts_rec_blocks;
     h.sps = ts_cfg.rate_2k ? 2000 : 1000;
@@ -805,7 +831,7 @@ static void ts_handle_request(void)
         {
             const uint16_t seq = ts_cfg.seq;
             const uint8_t old_rate = ts_cfg.rate_2k;
-            ts_cfg = ts_cfg_new; ts_cfg.magic = TS_CFG_MAGIC; ts_cfg.ver = 1; ts_cfg.seq = seq;
+            ts_cfg = ts_cfg_new; ts_cfg.magic = TS_CFG_MAGIC; ts_cfg.ver = 2; ts_cfg.seq = seq;
             const bool ok = ts_cfg_store();
             if (ts_cfg.rate_2k != old_rate) ts_ads_ok = ads_begin();
             ts_ack(ok ? TQR_OK : TQR_FAIL);

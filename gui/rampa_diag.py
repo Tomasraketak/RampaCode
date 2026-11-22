@@ -51,7 +51,11 @@ except ImportError:
 APP = "Rampa · Diagnostika"
 S_FIELDS = ["proto", "rstate", "sstate", "sflags", "sfaults", "vbat", "umb_ma", "v5", "c1", "c2", "c3", "rfaults",
             "key", "btn", "lora", "stand", "ads", "flash", "sps", "test_no", "free_kb", "total_kb", "ndir", "rec",
-            "progress", "t_rel", "ch", "fire_ms", "rec_s", "link_ms", "c1ok", "jedec", "rssi", "dropped", "fw"]
+            "progress", "t_rel", "ch", "fire_ms", "rec_s", "link_ms", "c1ok", "jedec", "rssi", "dropped", "fw",
+            "sv1", "sv2", "sv3", "sv4", "arm_servo", "as", "as_ms"]
+AS_NAMES = {0: "SAFE – spínač rozepnut", 1: "ARMING – servo se točí, čeká na klíč", 2: "ARMED – spínač sepnut",
+            3: "SELHALO – klíč nesepnul, servo zpět", 4: "ZKOUŠKA polohy"}
+SERVO_PINS = ["J12.1 · GP27", "J12.4 · GP28", "J12.7 · GP14", "J12.10 · GP22"]
 M_FIELDS = ["t_ms", "f", "fmax", "p", "pv", "t1", "t2", "uvv"]
 R_FIELDS = ["test_no", "flags", "ch", "peak", "impulse", "burn", "avg", "t_peak", "ign_delay", "pmax", "t1max",
             "t2max", "curve_n", "curve_hz", "n_frames", "sps", "t0_idx", "hang"]
@@ -78,6 +82,9 @@ CFG_HELP = {
     "fire_ms": "výchozí délka pulzu do rozbušky [ms]", "rec_s": "záznam po T-0 [s]",
     "pyro_ch": "výchozí rozbuška 1–3", "rate_2k": "1 = 2000 S/s (turbo), 0 = 1000 S/s",
     "cd_s": "výchozí odpočet [s] (nápověda pro stanici)",
+    "arm_servo": "servo bezpečnostního spínače 1–4, 0 = jen klíč",
+    "arm_us": "puls serva: spínač SEPNUT [µs]", "safe_us": "puls serva: spínač ROZEPNUT [µs]",
+    "arm_settle_ms": "do kdy po natočení musí klíč sepnout [ms]",
 }
 
 
@@ -186,7 +193,10 @@ class DemoRampa(QtCore.QObject):
         self.t0 = time.time()
         self.cfg = dict(lc_offset=0, lc_scale=0.0, p_zero=0.1, p_span=0.8, p_full_psi=500.0, adc_vref=3.3, p_div=1.47,
                         th_r0=10000.0, th_beta=3950.0, th_t0_c=25.0, th_rfix=10000.0, ign_thr_n=2.0, fire_ms=1000,
-                        rec_s=20, pyro_ch=1, rate_2k=1, cd_s=10)
+                        rec_s=20, pyro_ch=1, rate_2k=1, cd_s=10, arm_servo=1, arm_us=2000, safe_us=1000,
+                        arm_settle_ms=1500)
+        self.sv = [1000, 0, 0, 0]
+        self.as_state, self.as_t, self.as_ms = 0, 0.0, 0
         self.code_off, self.code_per_n = 21345.0, 850.0
         self.load_n = 0.0
         self.stand, self.sstate, self.rec_end = False, 0, 0.0
@@ -208,12 +218,13 @@ class DemoRampa(QtCore.QObject):
         cfg = dict(self.cfg)
         cfg["lc_offset"] = int(self.code_off)
         cfg["lc_scale"] = 1.0 / self.code_per_n
-        vals = [0x31464352, 1, 3, cfg["lc_offset"], cfg["lc_scale"], cfg["p_zero"], cfg["p_span"], cfg["p_full_psi"],
+        vals = [0x31464352, 2, 3, cfg["lc_offset"], cfg["lc_scale"], cfg["p_zero"], cfg["p_span"], cfg["p_full_psi"],
                 cfg["adc_vref"], cfg["p_div"], cfg["th_r0"], cfg["th_beta"], cfg["th_t0_c"], cfg["th_rfix"],
-                cfg["ign_thr_n"], cfg["fire_ms"], cfg["rec_s"], cfg["pyro_ch"], cfg["rate_2k"], cfg["cd_s"], 0]
+                cfg["ign_thr_n"], cfg["fire_ms"], cfg["rec_s"], cfg["pyro_ch"], cfg["rate_2k"], cfg["cd_s"],
+                cfg["arm_servo"], cfg["arm_us"], cfg["safe_us"], cfg["arm_settle_ms"], 0]
         cfgb = rr.CFG.pack(*vals)
         sps, n_frames = 2000, 2000 * 8
-        hdr = rr.HDR.pack(rr.HDR_MAGIC, 1, test, 4, sps, int(cold), 1, 1000, 5, 3, 4990) + cfgb
+        hdr = rr.HDR.pack(rr.HDR_MAGIC, 2, test, 4, sps, int(cold), 1, 1000, 5, 3, 4990) + cfgb
         hdr += b"\xff" * (126 - len(hdr))
         hdr += struct.pack("<H", rr.crc16(hdr))
         frames = bytearray()
@@ -307,6 +318,29 @@ class DemoRampa(QtCore.QObject):
                 self.line.emit("#OK ERASEALL")
             else:
                 self.line.emit("#ERR ERASEALL YES  (deletes every record)")
+        elif c == "SERVO" and len(a) >= 2:
+            n = to_i(a[0])
+            if not 1 <= n <= 4:
+                self.line.emit("#ERR SERVO <1-4> <500-2500 us | OFF>")
+            elif a[1].upper() == "OFF":
+                if n == self.cfg["arm_servo"]:
+                    self.line.emit(f"#ERR SERVO {n}: the arming servo stays driven (SAFE position)")
+                else:
+                    self.sv[n - 1] = 0
+                    self.line.emit(f"#OK SERVO {n} OFF")
+            else:
+                self.sv[n - 1] = to_i(a[1])
+                arm = n == self.cfg["arm_servo"] and self.sv[n - 1] != self.cfg["safe_us"]
+                if arm:
+                    self.as_state, self.as_t = 4, self.now() + 10
+                self.line.emit(f"#OK SERVO {n} {a[1]}" + (" (arming servo: back to SAFE in 10 s)" if arm else ""))
+        elif c == "ARMTEST":
+            if not self.cfg["arm_servo"]:
+                self.line.emit("#ERR ARMTEST: no arming servo configured (SET arm_servo 1-4)")
+            else:
+                self.sv[self.cfg["arm_servo"] - 1] = self.cfg["arm_us"]
+                self.as_state, self.as_t = 1, self.now()
+                self.line.emit("#OK ARMTEST started (servo to arm_us, waiting for the key sense)")
         elif c == "LOAD":                                # demo only: put a weight on the load cell
             self.load_n = to_f(a[0] if a else 0, 0)
         else:
@@ -332,6 +366,14 @@ class DemoRampa(QtCore.QObject):
             k = len(self.records) + 1
             self.records.append(self._make_record(k, cold=True))
             self.line.emit(f"$R,{k},{0x30 | 0x40 | 0x10 | 8},1,{self.load_n:.3f},0,0,0,0,0,0.5,23.0,24.0,500,100,10000,2000,-1,0")
+        if self.as_state == 1 and t - self.as_t > 0.6:
+            self.as_state, self.as_ms, self.as_t = 4, 600, t + 3
+            self.line.emit("#OK ARMTEST key closed after 600 ms, servo back to SAFE in 3 s")
+        if self.as_state == 4 and t > self.as_t:
+            self.as_state = 0
+            if self.cfg["arm_servo"]:
+                self.sv[self.cfg["arm_servo"] - 1] = self.cfg["safe_us"]
+        key = 1 if (not self.cfg["arm_servo"] or self.sv[self.cfg["arm_servo"] - 1] >= 1800) else 0
         cal = self.cfg["lc_scale"]
         code = self.code_off + self.load_n * self.code_per_n + random.gauss(0, 6)
         d = code - self.cfg["lc_offset"]
@@ -344,9 +386,11 @@ class DemoRampa(QtCore.QObject):
             st = self.sstate if self.stand else -1
             flags = 0x01 | 0x02 | 0x20 | 0x40 | (0x80 if cal else 0) | 0x100 | 0x400 | (0x10 if self.sstate == 7 else 0)
             free = 16320 - 512 * len(self.records)
-            self.line.emit(f"$S,NONE,1,{st},{flags},0,8030,0,4992,1210,30,28,0,1,0,1,{int(self.stand)},1,1,2000,"
+            flags = (flags & ~1) | key
+            self.line.emit(f"$S,NONE,1,{st},{flags},0,8030,0,4992,1210,30,28,0,{key},0,1,{int(self.stand)},1,1,2000,"
                            f"{len(self.records)},{free},16320,{len(self.records)},{3 if self.sstate == 7 else 0},0,"
-                           f"0,1,{self.cfg['fire_ms']},{self.cfg['rec_s']},-1,1,EF4018,-58,0,300")
+                           f"0,1,{self.cfg['fire_ms']},{self.cfg['rec_s']},-1,1,EF4018,-58,0,300,"
+                           f"{self.sv[0]},{self.sv[1]},{self.sv[2]},{self.sv[3]},{self.cfg['arm_servo']},{self.as_state},{self.as_ms}")
 
 
 # =====================================================================
@@ -622,6 +666,7 @@ class RampaDiag(QtWidgets.QMainWindow):
         self._tab_overview()
         self._tab_measure()
         self._tab_calib()
+        self._tab_servos()
         self._tab_records()
         self._tab_console()
         self.status = self.statusBar()
@@ -644,7 +689,8 @@ class RampaDiag(QtWidgets.QMainWindow):
         c1.body.setLayout(gl)
         c2 = Card("AO4407A · AO3400A · ADS1115", "Pyro výstupy")
         gl, self.ov_pyro = kv_grid([("c1", "Rozbuška 1 (J5)"), ("c2", "Rozbuška 2 (J6)"), ("c3", "Rozbuška 3 (J7)"),
-                                    ("sel", "Zvolená / puls"), ("rfaults", "Blokování raketa"), ("sfaults", "Blokování test")])
+                                    ("sel", "Zvolená / puls"), ("arm", "Spínač (servo)"), ("rfaults", "Blokování raketa"),
+                                    ("sfaults", "Blokování test")])
         c2.body.setLayout(gl)
         c3 = Card("POGO J3 · RA-02 433 MHZ", "Raketa a spojení")
         gl, self.ov_link = kv_grid([("proto", "Na pogu"), ("rstate", "Stav rampy (raketa)"), ("stand", "Test motoru"),
@@ -829,6 +875,133 @@ class RampaDiag(QtWidgets.QMainWindow):
         g.setColumnStretch(0, 1)
         g.setColumnStretch(1, 1)
         self._scroll(w, "Kalibrace")
+
+    def _tab_servos(self):
+        w = QtWidgets.QWidget()
+        g = QtWidgets.QGridLayout(w)
+        g.setContentsMargins(20, 20, 20, 20)
+        g.setSpacing(16)
+        # --- the arming switch
+        c1 = Card("DRUHÝ SPÍNAČ V SÉRII S KLÍČEM J4", "Bezpečnostní spínač (servo)")
+        vl = QtWidgets.QVBoxLayout(c1.body)
+        info = label("Pyro napájení jde přes dva spínače v sérii: klíč, který sepne poslední člověk u rampy, a spínač "
+                     "otočený servem až na povel z dálky – ARM ze stanice (test motoru) nebo PREPARE od rakety na pogu. "
+                     "Rampa servo natočí jen když je vše ostatní v pořádku a do nastavené doby musí cítit sepnutý klíč, "
+                     "jinak servo vrátí. Zpět do SAFE: SAFE / DISARM / ABORT, hned po pulzu do rozbušky, ztráta spojení.",
+                     "muted")
+        info.setWordWrap(True)
+        vl.addWidget(info)
+        warn = label("⚠ Serva na J12 jsou napájená přímo z baterie (2S, až 8,4 V) – použij HV servo (7,4–8,4 V).", "subtle")
+        warn.setWordWrap(True)
+        warn.setStyleSheet(f"color: {C['accent']};")
+        vl.addWidget(warn)
+        f = QtWidgets.QFormLayout()
+        self.as_cb = QtWidgets.QComboBox()
+        self.as_cb.addItems(["vypnuto (jen klíč)"] + [f"Servo {i + 1} ({SERVO_PINS[i]})" for i in range(4)])
+        self.as_safe = QtWidgets.QSpinBox()
+        self.as_arm = QtWidgets.QSpinBox()
+        for sp in (self.as_safe, self.as_arm):
+            sp.setRange(500, 2500)
+            sp.setSingleStep(10)
+            sp.setSuffix(" µs")
+        self.as_safe.setValue(1000)
+        self.as_arm.setValue(2000)
+        self.as_settle = QtWidgets.QSpinBox()
+        self.as_settle.setRange(200, 10000)
+        self.as_settle.setSingleStep(100)
+        self.as_settle.setValue(1500)
+        self.as_settle.setSuffix(" ms")
+        f.addRow("Servo spínače", self.as_cb)
+        f.addRow("Poloha SAFE (rozepnuto)", self.as_safe)
+        f.addRow("Poloha ARM (sepnuto)", self.as_arm)
+        f.addRow("Klíč musí sepnout do", self.as_settle)
+        vl.addLayout(f)
+        row = QtWidgets.QHBoxLayout()
+        b_w = button("Zapsat do rampy", "primary")
+        b_w.clicked.connect(self.write_arm_servo)
+        b_s = button("Vyzkoušet SAFE")
+        b_s.clicked.connect(lambda: self._as_try(self.as_safe.value()))
+        b_a = button("Vyzkoušet ARM (10 s)")
+        b_a.clicked.connect(lambda: self._as_try(self.as_arm.value(), arm=True))
+        for x in (b_w, b_s, b_a):
+            row.addWidget(x)
+        vl.addLayout(row)
+        b_t = button("ARMTEST – sepne klíč? (rozbuška odpojená!)", "danger",
+                     "Servo do ARM, rampa změří, za jak dlouho sepne klíč, a vrátí servo do SAFE")
+        b_t.clicked.connect(lambda: self._confirm("ARMTEST: servo sepne pyro napájení (lidský klíč musí být zapnutý).\n\n"
+                                                  "ROZBUŠKU MĚJ ODPOJENOU. Pokračovat?", "ARMTEST"))
+        vl.addWidget(b_t)
+        gl, self.as_vals = kv_grid([("state", "Stav spínače"), ("key", "Klíč (za oběma spínači)"), ("close", "Poslední sepnutí")])
+        vl.addLayout(gl)
+        vl.addStretch(1)
+        g.addWidget(c1, 0, 0, 2, 1)
+        # --- the four servos
+        self.sv_rows = []
+        for i in range(4):
+            c = Card(SERVO_PINS[i], f"Servo {i + 1}")
+            vl = QtWidgets.QVBoxLayout(c.body)
+            sl = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+            sl.setRange(500, 2500)
+            sl.setValue(1500)
+            sp = QtWidgets.QSpinBox()
+            sp.setRange(500, 2500)
+            sp.setValue(1500)
+            sp.setSuffix(" µs")
+            sl.valueChanged.connect(sp.setValue)
+            sp.valueChanged.connect(sl.setValue)
+            sl.sliderReleased.connect(lambda i=i, sp=sp: self._servo(i, sp.value()))
+            sp.editingFinished.connect(lambda i=i, sp=sp: self._servo(i, sp.value()))
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(sl, 1)
+            row.addWidget(sp)
+            vl.addLayout(row)
+            row = QtWidgets.QHBoxLayout()
+            for txt, us in (("1000", 1000), ("1500", 1500), ("2000", 2000)):
+                b = button(txt)
+                b.clicked.connect(lambda _=False, i=i, us=us, sp=sp: (sp.setValue(us), self._servo(i, us)))
+                row.addWidget(b)
+            b = button("Uvolnit", tip="Přestat posílat pulzy (servo se nedrží)")
+            b.clicked.connect(lambda _=False, i=i: self.send(f"SERVO {i + 1} OFF"))
+            row.addWidget(b)
+            row.addStretch(1)
+            vl.addLayout(row)
+            st = label("—", "value")
+            vl.addWidget(st)
+            self.sv_rows.append((sp, st))
+            g.addWidget(c, i // 2, 1 + i % 2)
+        g.setColumnStretch(0, 3)
+        g.setColumnStretch(1, 2)
+        g.setColumnStretch(2, 2)
+        g.setRowStretch(2, 1)
+        self._scroll(w, "Serva")
+
+    def _servo(self, i: int, us: int):
+        arm = to_i(self.cfg.get("arm_servo")) == i + 1
+        if arm and us != to_i(self.cfg.get("safe_us"), -1):
+            if QtWidgets.QMessageBox.question(self, APP, f"Servo {i + 1} ovládá bezpečnostní spínač – {us} µs může sepnout "
+                                              "pyro napájení. Rampa ho za 10 s sama vrátí do SAFE.\n\nPokračovat?") \
+                    != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        self.send(f"SERVO {i + 1} {us}")
+
+    def _as_try(self, us: int, arm: bool = False):
+        n = self.as_cb.currentIndex()
+        if n == 0:
+            QtWidgets.QMessageBox.information(self, APP, "Nejdřív vyber servo spínače.")
+            return
+        if arm and QtWidgets.QMessageBox.question(self, APP, "Poloha ARM může sepnout pyro napájení (rozbušku měj odpojenou). "
+                                                  "Za 10 s se servo samo vrátí do SAFE. Pokračovat?") \
+                != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self.send(f"SERVO {n} {us}")
+
+    def write_arm_servo(self):
+        if self.as_arm.value() == self.as_safe.value():
+            QtWidgets.QMessageBox.warning(self, APP, "Polohy SAFE a ARM musí být různé.")
+            return
+        for k, v in (("safe_us", self.as_safe.value()), ("arm_us", self.as_arm.value()),
+                     ("arm_settle_ms", self.as_settle.value()), ("arm_servo", self.as_cb.currentIndex())):
+            self._queue(f"SET {k} {v}")
 
     def _tab_records(self):
         w = QtWidgets.QWidget()
@@ -1084,7 +1257,7 @@ class RampaDiag(QtWidgets.QMainWindow):
         elif tag == "$DBEGIN" and len(p) >= 4:
             self.dump = [to_i(p[1]), bytearray(), to_i(p[3])]
             self.dl_bar.setValue(0)
-            self.tabs.setCurrentIndex(3)
+            self.tabs.setCurrentIndex(4)
         elif tag == "$DEND" and self.dump:
             self._finish_dump()
         elif s.startswith("#ERR"):
@@ -1139,6 +1312,11 @@ class RampaDiag(QtWidgets.QMainWindow):
             for col, it in enumerate((a, b, c)):
                 self.cfg_tab.setItem(r, col, it)
         self.cfg_tab.resizeColumnsToContents()
+        if "arm_servo" in self.cfg:
+            self.as_cb.setCurrentIndex(max(0, min(4, to_i(self.cfg["arm_servo"]))))
+            self.as_safe.setValue(to_i(self.cfg.get("safe_us"), 1000))
+            self.as_arm.setValue(to_i(self.cfg.get("arm_us"), 2000))
+            self.as_settle.setValue(to_i(self.cfg.get("arm_settle_ms"), 1500))
         pz, ps, pf = to_f(self.cfg.get("p_zero")), to_f(self.cfg.get("p_span")), to_f(self.cfg.get("p_full_psi"))
         if pz == pz and ps == ps:
             self.p_vz.setValue(pz * 5)
@@ -1182,7 +1360,8 @@ class RampaDiag(QtWidgets.QMainWindow):
             self.chips["state"].set(st_ok if live else None, f"Stav: {st_txt}")
             vb = to_i(s["vbat"]) / 1000
             self.chips["bat"].set(vb >= 7.2 or ("warn" if vb >= 6.6 else False), f"Baterie: {cz(vb, 2)} V")
-            self.chips["key"].set(to_i(s["key"]) == 1 or "warn", "Klíč: zapnut" if to_i(s["key"]) else "Klíč: vypnut")
+            self.chips["key"].set(to_i(s["key"]) == 1 or "warn", ("Klíč: sepnut" if to_i(s["key"]) else
+                                  ("Klíč: čeká na servo" if to_i(s.get("arm_servo")) else "Klíč: vypnut")))
             cont = "".join(str(i + 1) if to_i(s[f"c{i + 1}"]) >= CONT_MIN_MV else "–" for i in range(3))
             self.chips["cont"].set(True if cont != "–––" else "warn", f"Rozbušky: {cont}")
             self.chips["ads"].set(to_i(s["ads"]) == 1, f"ADS1220: {s['sps']} S/s" if to_i(s["ads"]) else "ADS1220: NEMĚŘÍ")
@@ -1206,6 +1385,14 @@ class RampaDiag(QtWidgets.QMainWindow):
                 mv = to_i(s[f"c{i + 1}"])
                 self.ov_pyro[f"c{i + 1}"].setText(f"{mv} mV  {'kontinuita OK' if mv >= CONT_MIN_MV else 'bez rozbušky'}")
             self.ov_pyro["sel"].setText(f"{s['ch']} · {s['fire_ms']} ms")
+            asv = to_i(s.get("arm_servo"))
+            self.ov_pyro["arm"].setText(f"servo {asv}: {AS_NAMES.get(to_i(s.get('as')), '?')}" if asv else "není (jen klíč)")
+            self.as_vals["state"].setText(f"servo {asv}: {AS_NAMES.get(to_i(s.get('as')), '?')}" if asv else "není nastaveno – jen klíč")
+            self.as_vals["key"].setText("SEPNUT – pyro napájení připojeno" if to_i(s["key"]) else "rozepnut")
+            self.as_vals["close"].setText(f"{s.get('as_ms')} ms po natočení" if to_i(s.get("as_ms")) else "—")
+            for i, (_sp, st) in enumerate(self.sv_rows):
+                us = to_i(s.get(f"sv{i + 1}"))
+                st.setText(("drží " + f"{us} µs" if us else "nedrží (bez pulzů)") + ("  · BEZPEČNOSTNÍ SPÍNAČ" if asv == i + 1 else ""))
             rf, sf = bits(to_i(s["rfaults"]), ROCKET_FAULTS), bits(to_i(s["sfaults"]), SL_FAULTS)
             self.ov_pyro["rfaults"].setText(", ".join(rf) or "žádné")
             self.ov_pyro["sfaults"].setText(", ".join(sf) or "žádné")
@@ -1231,7 +1418,9 @@ class RampaDiag(QtWidgets.QMainWindow):
             ch = max(1, min(3, to_i(s["ch"], 1)))
             sfl = to_i(s["sflags"])
             checks = [
-                (to_i(s["key"]) == 1, "Klíč J4 zapnut"),
+                ((to_i(s["key"]) == 1) or ("warn" if to_i(s.get("arm_servo")) else False),
+                 "Klíč J4 sepnut" if not to_i(s.get("arm_servo")) else
+                 ("Klíč + servo sepnuty" if to_i(s["key"]) else "Klíč: druhý spínač sepne servo až při ARM / PREPARE")),
                 (to_i(s[f"c{ch}"]) >= CONT_MIN_MV, f"Rozbuška {ch} má kontinuitu"),
                 (to_i(s["vbat"]) >= 6600, "Baterie ≥ 6,6 V"),
                 (to_i(s["ads"]) == 1, "ADS1220 měří"),

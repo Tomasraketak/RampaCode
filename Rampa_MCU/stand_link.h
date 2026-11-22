@@ -187,7 +187,8 @@ typedef struct {
     int16_t  f[SL_SUBS];     // 16 force, oldest first, mean of each slice
     int16_t  fpeak;          // 36 max force since the previous TLM
     int8_t   fexp;           // 38
-    uint8_t  pyro;           // 39 bits0-1 igniter 1..3, bits4-6 continuity ch1..3
+    uint8_t  pyro;           // 39 bits0-1 igniter 1..3, bit2 arming servo configured, bit3 arming switch
+                             //    closed by the servo, bits4-6 continuity ch1..3
     int16_t  p_dpsi;         // 40 chamber pressure, 0.1 psi
     int16_t  ppeak_dpsi;     // 42 max since previous TLM
     int16_t  t1_dc;          // 44 0.1 degC (SL_T_NONE)

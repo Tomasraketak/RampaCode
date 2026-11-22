@@ -90,6 +90,9 @@ QScrollBar::handle:vertical {{ background: {C['surface']}; border-radius: 5px; m
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
 QMessageBox QLabel {{ color: {C['text']}; }}
 QTabWidget::pane {{ border: none; border-top: 1px solid {C['line']}; }}
+QSlider::groove:horizontal {{ height: 4px; background: {C['surface']}; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: {C['accent']}; border-radius: 2px; }}
+QSlider::handle:horizontal {{ background: {C['accent_soft']}; width: 14px; margin: -6px 0; border-radius: 7px; }}
 QTabBar::tab {{ background: transparent; padding: 8px 18px; color: {C['muted']}; border: none; }}
 QTabBar::tab:hover {{ color: {C['text']}; }}
 QTabBar::tab:selected {{ color: {C['accent']}; border-bottom: 2px solid {C['accent']}; }}

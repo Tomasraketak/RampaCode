@@ -55,12 +55,27 @@
 //  the W25Q128 at the full ADC rate; it never touches the pyro pins.
 //  USB: text protocol for the diagnostic GUI (gui/rampa_diag.py), docs/USB_PROTOCOL.md.
 //  A motor is never fired from USB — only from the ground station.
+//
+//  ---------------------------------------------------------------------
+//  REMOTE ARMING SWITCH (servo, optional: SET arm_servo 1..4)
+//  ---------------------------------------------------------------------
+//  The pyro supply goes through TWO switches in series on J4: the key the
+//  last person closes before leaving the pad, and a switch turned by a servo
+//  (J12) once everybody is safe. The rampa turns the servo to arm_us only
+//  when an arm command comes AND every other interlock is fine:
+//      rocket on the pogo  PREPARE (Zenith READY / Ariadna "launch soon")
+//      thrust stand        ARM from the ground station (LoRa)
+//  and needs the key sense (after both switches) to close within
+//  arm_settle_ms, else it turns back and reports the key fault. It returns
+//  the servo to safe_us on SAFE / DISARM / ABORT / PING, right after the
+//  igniter pulse, on link loss, and whenever no arm command keeps it armed.
 // =====================================================================
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <LoRa.h>
 #include <Adafruit_NeoPixel.h>
+#include <Servo.h>
 #include "hardware/watchdog.h"
 #include "zenith_link.h"
 #include "ariadna_rampa_link.h"
@@ -83,6 +98,7 @@ static const uint8_t PIN_LORA_CS    = 13;
 static const uint8_t PIN_FIRE[3]    = { 16, 17, 18 };   // Q22/Q23/Q24 low side -> J5/J6/J7
 static const uint8_t PIN_PYRO_ARM   = 19;  // Q21 -> Q20 AO4407A high side (VPYRO_ARMED)
 static const uint8_t PIN_RGB        = 20;  // SK6812 via R56
+static const uint8_t PIN_SERVO[4]   = { 27, 28, 14, 22 };   // J12.1 / J12.4 / J12.7 / J12.10 (servo power = VBAT!)
 
 static const uint8_t ADDR_TCA       = 0x20;
 static const uint8_t ADDR_INA_BAT   = 0x40;
@@ -174,6 +190,8 @@ static uint8_t  s_i2c_tx[ARIADNA_RAMPA_STAT_SIZE];  // Ariadna status served fro
 #define EVT_SL_FIRE   (1u << 12)
 #define EVT_SL_ABORT  (1u << 13)
 #define EVT_SL_DONE   (1u << 14)
+#define EVT_ARM_OK    (1u << 15)
+#define EVT_ARM_FAIL  (1u << 16)
 
 // =====================================================================
 //  4. INTERNAL I2C1 (TCA9534, INA226 x2, ADS1115)
@@ -276,8 +294,50 @@ static void compute_flags(void)
     s_faults = fm;
 }
 
+// =====================================================================
+//  4b. SERVOS (J12) AND THE REMOTE ARMING SWITCH
+// =====================================================================
+enum : uint8_t { AS_SAFE = 0, AS_ARMING = 1, AS_ARMED = 2, AS_FAIL = 3, AS_TEST = 4 };
+static Servo    s_servo[4];
+static uint16_t s_servo_us[4] = { 0, 0, 0, 0 };     // 0 = not driven
+static volatile uint8_t  s_as = AS_SAFE;            // arming switch state
+static volatile uint8_t  s_as_req = 0;              // 1 = arm, 2 = safe (also from the I2C ISR)
+static volatile uint32_t s_as_hold_ms = 0;          // last rocket command that keeps it armed
+static bool     s_as_fail_latch = false;            // a failed arming is not retried until released
+static uint32_t s_as_ms = 0, s_as_test_end = 0;
+static uint16_t s_as_close_ms = 0;                  // how long the key took to close
+static uint8_t  s_armtest = 0;                      // USB ARMTEST: 1 running, 2 ok, 3 failed
+static uint8_t  s_as_cfg_servo = 0xFF;
+
+static bool arm_servo_on(void) { return ts_cfg.arm_servo >= 1 && ts_cfg.arm_servo <= 4; }
+static void servo_write(uint8_t i, uint16_t us)
+{
+    if (i > 3) return;
+    if (!s_servo[i].attached()) s_servo[i].attach(PIN_SERVO[i], 500, 2500);
+    s_servo[i].writeMicroseconds(us);
+    s_servo_us[i] = us;
+}
+static void servo_off(uint8_t i) { if (i <= 3) { if (s_servo[i].attached()) s_servo[i].detach(); s_servo_us[i] = 0; } }
+
+static void arm_safe(uint32_t now)
+{
+    if (arm_servo_on()) servo_write((uint8_t)(ts_cfg.arm_servo - 1), ts_cfg.safe_us);
+    s_as = AS_SAFE; s_as_ms = now;
+}
+static void arm_go(uint32_t now)
+{
+    if (!arm_servo_on() || s_as == AS_ARMING || s_as == AS_ARMED || s_as_fail_latch) return;
+    servo_write((uint8_t)(ts_cfg.arm_servo - 1), ts_cfg.arm_us);
+    s_as = AS_ARMING; s_as_ms = now;
+}
+/** True while the arming switch may be closed by the servo (or there is no servo). */
+static bool arm_pending(void) { return arm_servo_on() && s_as == AS_ARMING; }
+
+static void arm_service(uint32_t now);   // after the stand / rocket state (needs both)
+
 static void enter_abort(uint8_t why)
 {
+    s_as_req = 2;
     pyro_off();
     s_cd = false;
     s_latched |= why;
@@ -308,6 +368,7 @@ static void rampa_cmd(uint8_t proto, uint8_t cmd, uint8_t seq, int32_t t_rem, bo
         break;
 
     case 5:
+        s_as_req = 2;
         if (ariadna) {                                   // RAMPA_CMD_DETACH
             pyro_off(); s_cd = false; s_state = ZR_ST_IDLE; s_detach_req = true;
         } else {                                         // ZR_CMD_SAFE
@@ -317,6 +378,7 @@ static void rampa_cmd(uint8_t proto, uint8_t cmd, uint8_t seq, int32_t t_rem, bo
         break;
 
     case ZR_CMD_PING:
+        s_as_req = 2;                                    // the rocket is not prepared: switch open
         if (s_state == ZR_ST_FIRED) break;
         if (ariadna) {
             // Daidalos: a PING clears TIMEOUT/ROCKET/CLOCK and re-evaluates (also out of ABORT)
@@ -335,6 +397,14 @@ static void rampa_cmd(uint8_t proto, uint8_t cmd, uint8_t seq, int32_t t_rem, bo
         if (s_state == ZR_ST_FIRED && s_fire_end_ms) break;
         if (s_state == ZR_ST_ABORT && !ariadna) break;
         pyro_off(); s_cd = false;
+        if (arm_servo_on() && s_as != AS_FAIL && !s_as_fail_latch) {
+            // remote arming switch: close it only if everything else is GO, READY once the key senses it
+            if ((s_faults & ~ZL_RMPF_NO_KEY) == 0 && go) {
+                s_as_hold_ms = rx_ms ? rx_ms : 1;
+                s_as_req = 1;
+                if (!s_key) { s_state = ZR_ST_IDLE; break; }
+            } else s_as_req = 2;
+        }
         if (s_faults == 0 && go) { s_latched &= (uint8_t)~ZL_RMPF_ROCKET; s_state = ZR_ST_READY; }
         else { if (!go) s_latched |= ZL_RMPF_ROCKET; s_state = ZR_ST_FAULT; }
         break;
@@ -344,6 +414,7 @@ static void rampa_cmd(uint8_t proto, uint8_t cmd, uint8_t seq, int32_t t_rem, bo
         if (t_rem <= 0 || t_rem > (int32_t)ZL_CD_MAX_MS) { enter_abort(ZL_RMPF_CLOCK); break; }
         if (!go) { enter_abort(ZL_RMPF_ROCKET); break; }
         if (s_faults) { enter_abort(s_faults); break; }
+        s_as_hold_ms = rx_ms ? rx_ms : 1;
         {
             const uint32_t t0 = rx_ms + (uint32_t)t_rem;
             if (s_cd && labs((long)(int32_t)(t0 - s_t0_ms)) > 200) { enter_abort(ZL_RMPF_CLOCK); break; }
@@ -525,6 +596,7 @@ static void umbilical_service(uint32_t now)
         if ((uint32_t)(now - s_last_cmd_ms) > UNLOCK_MS && !critical_state()) {
             s_proto = P_NONE;
             s_evt |= EVT_UNLOCK;
+            s_as_req = 2;
             s_scan_slot_ms = now;
         }
         return;
@@ -663,11 +735,14 @@ static uint8_t stand_cmd(uint8_t cmd, int32_t arg, uint16_t arg2, uint16_t token
         s_sl_ch = (uint8_t)arg; s_sl_fire_ms = fms;
         const uint32_t blocks = ts_blocks_for(ts_cfg.rec_s + 5u);
         uint8_t f = (uint8_t)(sl_faults_live() & SL_ARM_FAULTS);
+        if (arm_servo_on()) f &= (uint8_t)~SL_FLT_KEY;           // the servo closes the arming switch now
         if (ts_flash_ok && ts_flash_free() < blocks * TS_BLOCK) f |= SL_FLT_FLASH;
         if (ts_rec != TR_IDLE) f |= SL_FLT_FLASH;
         if (f) { s_sl_latched = f; return SL_RC_REJ_INTLK; }
         if (!ts_request(TQ_REC_START, (int32_t)blocks, 0)) return SL_RC_BUSY;
         s_sl_latched = 0; s_sl_hang = false; s_sl_fired = false;
+        s_as_fail_latch = false;
+        arm_go(now);
         sl_set(SL_ST_ARMING, now);
         return SL_RC_OK; }
 
@@ -757,10 +832,14 @@ static void stand_service(uint32_t now)
 
     switch (s_sl) {
     case SL_ST_ARMING:
-        if (ts_rec == TR_READY) { sl_set(SL_ST_ARMED, now); s_evt |= EVT_SL_ARMED; break; }
+        if (arm_servo_on() && s_as == AS_FAIL) { stand_abort(SL_FLT_KEY, now); break; }
+        if (ts_rec == TR_READY && (!arm_servo_on() || s_as == AS_ARMED)) { sl_set(SL_ST_ARMED, now); s_evt |= EVT_SL_ARMED; break; }
         if ((ts_rec == TR_IDLE && ts_request_done() && (uint32_t)(now - s_sl_state_ms) > 300u) ||
             (uint32_t)(now - s_sl_state_ms) > 60000u) { stand_abort(SL_FLT_FLASH, now); break; }
-        if (live & (SL_FLT_KEY | SL_FLT_CONT | SL_FLT_BTN | SL_FLT_VBAT)) stand_abort(live & SL_ARM_FAULTS, now);
+        {
+            const uint8_t watch = (uint8_t)(SL_FLT_CONT | SL_FLT_BTN | SL_FLT_VBAT | (arm_pending() ? 0 : SL_FLT_KEY));
+            if (live & watch) stand_abort((uint8_t)(live & SL_ARM_FAULTS & (arm_pending() ? ~SL_FLT_KEY : 0xFF)), now);
+        }
         break;
 
     case SL_ST_ARMED:
@@ -926,7 +1005,7 @@ static void build_tlm(sl_tlm_t &t, uint32_t now)
     t.sps = ts_sps;
     uint8_t cb = 0;
     for (int i = 0; i < 3; i++) if (s_cont_mv[i] >= CONT_MIN_MV) cb |= (uint8_t)(1u << (4 + i));
-    t.pyro = (uint8_t)((s_sl_ch & 0x03) | cb);
+    t.pyro = (uint8_t)((s_sl_ch & 0x03) | cb | (arm_servo_on() ? 0x04 : 0) | (s_as == AS_ARMED ? 0x08 : 0));
     sl_seal(&t, sizeof t, SL_TLM_MAGIC);
 }
 
@@ -950,6 +1029,60 @@ static bool build_curve(sl_curve_t &c, int32_t off)
     c.n = n;
     sl_seal(&c, sizeof c, SL_CRV_MAGIC);
     return true;
+}
+
+/**
+ * Drives the arming servo: requests from the rocket commands / stand, the
+ * key-sense check, and the rule that nothing keeps it armed by accident.
+ */
+static void arm_service(uint32_t now)
+{
+    if (!ts_ready) return;
+    if (ts_cfg.arm_servo != s_as_cfg_servo) {               // boot / reconfigured: park in SAFE
+        if (s_as_cfg_servo >= 1 && s_as_cfg_servo <= 4 && s_as_cfg_servo != ts_cfg.arm_servo)
+            servo_write((uint8_t)(s_as_cfg_servo - 1), s_servo_us[s_as_cfg_servo - 1] ? s_servo_us[s_as_cfg_servo - 1] : ts_cfg.safe_us);
+        s_as_cfg_servo = ts_cfg.arm_servo;
+        s_as_fail_latch = false;
+        arm_safe(now);
+    }
+    if (!arm_servo_on()) { s_as = AS_SAFE; s_as_req = 0; return; }
+    const uint8_t r = s_as_req;
+    if (r) {
+        s_as_req = 0;
+        if (r == 2) { if (s_as != AS_SAFE || s_servo_us[ts_cfg.arm_servo - 1] != ts_cfg.safe_us) arm_safe(now); s_as_fail_latch = false; }
+        else arm_go(now);
+    }
+    if (s_as == AS_ARMING) {
+        if (s_key) { s_as = AS_ARMED; s_as_close_ms = (uint16_t)(now - s_as_ms); s_evt |= EVT_ARM_OK; }
+        else if ((uint32_t)(now - s_as_ms) > ts_cfg.arm_settle_ms) {
+            servo_write((uint8_t)(ts_cfg.arm_servo - 1), ts_cfg.safe_us);
+            s_as = AS_FAIL; s_as_fail_latch = true; s_evt |= EVT_ARM_FAIL;
+        }
+    }
+    if (s_armtest == 1) {
+        if (s_as == AS_ARMED) { s_armtest = 2; s_as = AS_TEST; s_as_test_end = now + 3000; }
+        else if (s_as == AS_FAIL) { s_armtest = 3; s_as_fail_latch = false; }
+    }
+    if (s_as == AS_TEST && (int32_t)(now - s_as_test_end) >= 0) arm_safe(now);
+
+    // who may keep the switch closed?
+    if (s_as == AS_ARMING || s_as == AS_ARMED) {
+        bool hold;
+        if (s_armtest == 1) hold = true;
+        else if (s_stand) hold = s_sl == SL_ST_ARMING || s_sl == SL_ST_ARMED || s_sl == SL_ST_COUNTDOWN || s_sl == SL_ST_FIRING;
+        else hold = s_state == ZR_ST_COMMITTED || (s_state == ZR_ST_FIRED && s_fire_end_ms) ||
+                    (s_as_hold_ms && (uint32_t)(now - s_as_hold_ms) < 1500u &&
+                     (s_state == ZR_ST_READY || s_state == ZR_ST_COUNTDOWN || s_state == ZR_ST_IDLE));
+        if (!hold) arm_safe(now);
+    }
+}
+
+/** Arming switch of a test from USB: allowed only when nothing is armed or counting. */
+static bool arm_usb_allowed(void)
+{
+    if (s_stand && s_sl != SL_ST_SAFE && s_sl != SL_ST_ABORT) return false;
+    if (s_state == ZR_ST_READY || s_state == ZR_ST_COUNTDOWN || s_state == ZR_ST_COMMITTED || s_state == ZR_ST_FIRED) return false;
+    return s_as != AS_ARMING && s_as != AS_ARMED;
 }
 
 // =====================================================================
@@ -1165,7 +1298,6 @@ static void outputs_update(uint32_t now)
     if (c != c_last) { s_rgb.setPixelColor(0, s_rgb.Color((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)); s_rgb.show(); c_last = c; }
 }
 
-static const char *SL_NAME[SL_ST_COUNT] = { "SAFE", "ARMING", "ARMED", "COUNTDOWN", "FIRING", "BURN", "ABORT", "RECORD" };
 
 static void print_events(void)
 {
@@ -1188,6 +1320,8 @@ static void print_events(void)
     if (e & EVT_SL_CD)    Serial.printf("# STAND: COUNTDOWN T-%ld ms\n", (long)(int32_t)(s_sl_t0 - millis()));
     if (e & EVT_SL_FIRE)  Serial.printf("# STAND: FIRE igniter %u for %u ms\n", s_sl_ch, s_sl_fire_ms);
     if (e & EVT_SL_ABORT) Serial.printf("# STAND: ABORT faults 0x%02X\n", s_sl_latched);
+    if (e & EVT_ARM_OK)   Serial.printf("# ARM SERVO: arming switch closed (key sensed after %u ms)\n", s_as_close_ms);
+    if (e & EVT_ARM_FAIL) Serial.printf("# ARM SERVO: key not sensed within %u ms -> servo back to SAFE (human switch off? servo position?)\n", ts_cfg.arm_settle_ms);
     if (e & EVT_SL_DONE)  Serial.printf("# STAND: record %u closed, peak %.1f, impulse %.2f, burn %.2f s%s\n",
                                         ts_test_no, (double)ts_res.peak_n, (double)ts_res.impulse_ns, (double)ts_res.burn_s,
                                         s_sl_hang ? " -- NO IGNITION SEEN (hang-fire?)" : "");
@@ -1216,7 +1350,7 @@ static void usb_status(uint32_t now)
 {
     static const char *PN[3] = { "NONE", "ZENITH", "ARIADNA" };
     const uint32_t link = s_sl_rx_ms ? now - s_sl_rx_ms : 0xFFFFFFFFu;
-    usb_line("$S,%s,%u,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%d,%d,%d,%d,%u,%u,%lu,%lu,%u,%u,%u,%ld,%u,%u,%u,%ld,%d,%06lX,%d,%u,%u",
+    usb_line("$S,%s,%u,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%d,%d,%d,%d,%u,%u,%lu,%lu,%u,%u,%u,%ld,%u,%u,%u,%ld,%d,%06lX,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u",
              PN[s_proto], s_state, s_stand ? (int)s_sl : -1, stand_flags(),
              (unsigned)(s_sl_latched | sl_faults_live()), s_vbat_mv, s_umb_ma, s_v5_mv,
              s_cont_mv[0], s_cont_mv[1], s_cont_mv[2], (unsigned)(s_faults | s_latched),
@@ -1225,7 +1359,8 @@ static void usb_status(uint32_t now)
              ts_ndir, ts_rec, ts_progress,
              (long)((s_stand && (s_sl == SL_ST_COUNTDOWN || s_sl == SL_ST_FIRING || s_sl == SL_ST_BURN || s_sl == SL_ST_RECORD)) ? (int32_t)(now - s_sl_t0) : 0),
              s_sl_ch, s_sl_fire_ms, ts_cfg.rec_s, (long)(link > 99999999u ? -1 : (int32_t)link), s_c1_ok,
-             (unsigned long)ts_jedec, s_lora_rssi, (unsigned)(ts_dropped & 0xFFFF), RAMPA_FW_VERSION);
+             (unsigned long)ts_jedec, s_lora_rssi, (unsigned)(ts_dropped & 0xFFFF), RAMPA_FW_VERSION,
+             s_servo_us[0], s_servo_us[1], s_servo_us[2], s_servo_us[3], ts_cfg.arm_servo, s_as, s_as_close_ms);
 }
 
 static void usb_cfg(void)
@@ -1248,6 +1383,10 @@ static void usb_cfg(void)
     usb_line("$CFG,pyro_ch,%u", c.pyro_ch);
     usb_line("$CFG,rate_2k,%u", c.rate_2k);
     usb_line("$CFG,cd_s,%u", c.cd_s);
+    usb_line("$CFG,arm_servo,%u", c.arm_servo);
+    usb_line("$CFG,arm_us,%u", c.arm_us);
+    usb_line("$CFG,safe_us,%u", c.safe_us);
+    usb_line("$CFG,arm_settle_ms,%u", c.arm_settle_ms);
     usb_line("#OK CFG");
 }
 
@@ -1281,6 +1420,10 @@ static bool cfg_set(ts_cfg_t &c, const char *k, const char *v)
     else if (!strcmp(k, "pyro_ch") && i >= 1 && i <= 3) c.pyro_ch = (uint8_t)i;
     else if (!strcmp(k, "rate_2k") && (i == 0 || i == 1)) c.rate_2k = (uint8_t)i;
     else if (!strcmp(k, "cd_s") && i >= SL_CD_MIN_S && i <= SL_CD_MAX_S) c.cd_s = (uint16_t)i;
+    else if (!strcmp(k, "arm_servo") && i >= 0 && i <= 4) c.arm_servo = (uint8_t)i;
+    else if (!strcmp(k, "arm_us") && ts_servo_us_ok((uint16_t)i)) c.arm_us = (uint16_t)i;
+    else if (!strcmp(k, "safe_us") && ts_servo_us_ok((uint16_t)i)) c.safe_us = (uint16_t)i;
+    else if (!strcmp(k, "arm_settle_ms") && i >= 200 && i <= 10000) c.arm_settle_ms = (uint16_t)i;
     else return false;
     return true;
 }
@@ -1332,6 +1475,34 @@ static void usb_command(char *l, uint32_t now)
         else usb_line("#ERR STAND 0: not safe");
         return;
     }
+    if (!strcmp(a0, "SERVO")) {
+        // SERVO <1-4> <500-2500 us> | SERVO <1-4> OFF
+        const long n = a1 ? atol(a1) : 0;
+        if (n < 1 || n > 4 || !a2) { usb_line("#ERR SERVO <1-4> <500-2500 us | OFF>"); return; }
+        const bool is_arm = arm_servo_on() && n == ts_cfg.arm_servo;
+        if (is_arm && !arm_usb_allowed()) { usb_line("#ERR SERVO %ld is the arming switch and the rampa is armed / counting", n); return; }
+        for (char *p = a2; *p; p++) if (*p >= 'a' && *p <= 'z') *p = (char)(*p - 32);
+        if (!strcmp(a2, "OFF")) {
+            if (is_arm) { usb_line("#ERR SERVO %ld: the arming servo stays driven (SAFE position)", n); return; }
+            servo_off((uint8_t)(n - 1)); usb_line("#OK SERVO %ld OFF", n); return;
+        }
+        const long us = atol(a2);
+        if (!ts_servo_us_ok((uint16_t)us)) { usb_line("#ERR SERVO pulse 500-2500 us"); return; }
+        servo_write((uint8_t)(n - 1), (uint16_t)us);
+        if (is_arm && us != ts_cfg.safe_us) { s_as = AS_TEST; s_as_test_end = now + 10000; }   // back to SAFE in 10 s
+        usb_line("#OK SERVO %ld %ld%s", n, us, is_arm && us != ts_cfg.safe_us ? " (arming servo: back to SAFE in 10 s)" : "");
+        return;
+    }
+    if (!strcmp(a0, "ARMTEST")) {
+        if (!arm_servo_on()) { usb_line("#ERR ARMTEST: no arming servo configured (SET arm_servo 1-4)"); return; }
+        if (!arm_usb_allowed() || s_proto != P_NONE) { usb_line("#ERR ARMTEST: not now (rocket on the pogo / armed / counting)"); return; }
+        s_as_fail_latch = false;
+        if (s_as == AS_TEST) arm_safe(now);
+        s_armtest = 1;
+        arm_go(now);
+        usb_line("#OK ARMTEST started (servo to arm_us, waiting for the key sense)");
+        return;
+    }
     if (!strcmp(a0, "REC")) { usb_stand(SL_C_RECORD, a1 ? atol(a1) : 10, "REC", now); return; }
     if (!strcmp(a0, "STOP")) { usb_stand(SL_C_STOP, 0, "STOP", now); return; }
     // ---- calibration (only when nothing is armed)
@@ -1354,6 +1525,8 @@ static void usb_command(char *l, uint32_t now)
         if (!strcmp(a0, "DEFAULTS")) {
             ts_cfg_defaults(ts_cfg_new);
             ts_cfg_new.lc_offset = ts_cfg.lc_offset; ts_cfg_new.lc_scale = ts_cfg.lc_scale;   // keep the calibration
+            ts_cfg_new.arm_servo = ts_cfg.arm_servo; ts_cfg_new.arm_us = ts_cfg.arm_us;       // and the arming servo
+            ts_cfg_new.safe_us = ts_cfg.safe_us; ts_cfg_new.arm_settle_ms = ts_cfg.arm_settle_ms;
         } else if (!strcmp(a0, "LCRATED")) {
             // LCRATED <capacity kg> <sensitivity mV/V>: theoretical scale without a weight
             const double kg = a1 ? atof(a1) : 0, mvv = a2 ? atof(a2) : 0;
@@ -1391,7 +1564,7 @@ static void usb_command(char *l, uint32_t now)
         usb_request(TQ_ERASE_ALL, 0, "ERASEALL");
         return;
     }
-    usb_line("#ERR HELLO STATUS LIVE CFG SET LCRATED DEFAULTS TARE CAL PZERO REC STOP LIST DUMP RESULT ERASEALL BUZZER STAND DISARM ABORT");
+    usb_line("#ERR HELLO STATUS LIVE CFG SET LCRATED DEFAULTS TARE CAL PZERO REC STOP LIST DUMP RESULT ERASEALL BUZZER STAND DISARM ABORT SERVO ARMTEST");
 }
 
 static void usb_service(uint32_t now)
@@ -1402,6 +1575,8 @@ static void usb_service(uint32_t now)
         if (c == '\n' || c == '\r') { if (n) { line[n] = 0; usb_command(line, now); n = 0; } }
         else if (n < sizeof(line) - 1) line[n++] = c;
     }
+    if (s_armtest == 2) { s_armtest = 0; usb_line("#OK ARMTEST key closed after %u ms, servo back to SAFE in 3 s", s_as_close_ms); }
+    if (s_armtest == 3) { s_armtest = 0; usb_line("#ERR ARMTEST key not sensed within %u ms (human switch off? arm_us wrong?) - servo back to SAFE", ts_cfg.arm_settle_ms); }
     // finished USB request
     if (s_usb_req_wait && ts_request_done()) {
         s_usb_req_wait = false;
@@ -1514,7 +1689,7 @@ void loop()
         }
     }
     if (s_state == ZR_ST_FIRED) {
-        if (s_fire_end_ms && (int32_t)(now - s_fire_end_ms) >= 0) { pyro_off(); s_fire_end_ms = 0; }
+        if (s_fire_end_ms && (int32_t)(now - s_fire_end_ms) >= 0) { pyro_off(); s_fire_end_ms = 0; s_as_req = 2; }
         if (!s_fire_end_ms && (uint32_t)(now - s_fired_ms) > POST_FIRE_MS) s_state = ZR_ST_IDLE;
     }
     // the pyro outputs belong to exactly one owner: a rocket launch or the thrust stand
@@ -1524,6 +1699,7 @@ void loop()
     interrupts();
 
     stand_service(now);
+    arm_service(now);
 
     // ---- rocket supply protection ------------------------------------------------
     if ((s_exp_out & EXP_ROCKET_EN) && s_umb_ma > UMB_OVERCURRENT) { s_umb_trip = true; s_evt |= EVT_UMB_TRIP; }

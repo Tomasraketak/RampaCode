@@ -21,13 +21,15 @@ from dataclasses import dataclass, field
 HDR_MAGIC = 0x31535452      # "RTS1"
 END_MAGIC = 0x31444E45      # "END1"
 FRAMES_OFF = 256
-CFG = struct.Struct("<IHHi11fHHBBH2xH")                    # ts_cfg_t, 68 B
+CFG_V1 = struct.Struct("<IHHi11fHHBBH2xH")                 # ts_cfg_t v1, 68 B (records before the arming servo)
+CFG = struct.Struct("<IHHi11fHHBBHBxHHHH")                 # ts_cfg_t v2, 74 B
 HDR = struct.Struct("<IHHIHBBHHHH")                        # first 24 B of ts_hdr_t
 END = struct.Struct("<IIiBBH7fhhI")                        # first 52 B of ts_end_t
 FRAME = struct.Struct("<IiHHHBB")                          # ts_frame_t, 16 B
-CFG_KEYS = ["magic", "ver", "seq", "lc_offset", "lc_scale", "p_zero", "p_span", "p_full_psi", "adc_vref", "p_div",
-            "th_r0", "th_beta", "th_t0_c", "th_rfix", "ign_thr_n", "fire_ms", "rec_s", "pyro_ch", "rate_2k", "cd_s",
-            "crc"]
+CFG_KEYS_V1 = ["magic", "ver", "seq", "lc_offset", "lc_scale", "p_zero", "p_span", "p_full_psi", "adc_vref", "p_div",
+               "th_r0", "th_beta", "th_t0_c", "th_rfix", "ign_thr_n", "fire_ms", "rec_s", "pyro_ch", "rate_2k", "cd_s",
+               "crc"]
+CFG_KEYS = CFG_KEYS_V1[:-1] + ["arm_servo", "arm_us", "safe_us", "arm_settle_ms", "crc"]
 UVV_PER_CODE = 1.0e6 / (128.0 * 8388608.0)
 STATE_NAMES = ["SAFE", "ARMING", "ARMED", "COUNTDOWN", "FIRING", "BURN", "ABORT", "RECORD"]
 FR_FIRE, FR_TH1, FR_TH2, FR_NOLC = 1, 2, 4, 8
@@ -116,9 +118,12 @@ def decode(img: bytes) -> Record:
     if h[0] != HDR_MAGIC or crc16(img[:126]) != struct.unpack_from("<H", img, 126)[0]:
         raise ValueError("bad record header")
     r = Record()
-    _m, _ver, r.test_no, _blocks, r.sps, cold, r.pyro_ch, r.fire_ms, r.rec_s, _cd, r.v5_mv = h
+    _m, ver, r.test_no, _blocks, r.sps, cold, r.pyro_ch, r.fire_ms, r.rec_s, _cd, r.v5_mv = h
     r.cold = bool(cold)
-    r.cfg = dict(zip(CFG_KEYS, CFG.unpack_from(img, 24)))
+    if ver >= 2:
+        r.cfg = dict(zip(CFG_KEYS, CFG.unpack_from(img, 24)))
+    else:
+        r.cfg = dict(zip(CFG_KEYS_V1, CFG_V1.unpack_from(img, 24)))
     e = END.unpack_from(img, 128)
     if e[0] == END_MAGIC and crc16(img[128:254]) == struct.unpack_from("<H", img, 254)[0]:
         r.closed = True

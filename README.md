@@ -161,12 +161,29 @@ stisku tlačítka nebo výpadku měření/záznamu. Když se rozbuška odpálí 
   oranžová + pípání = odpočet, červená = zážeh/záznam, azurová = zkušební záznam, fialová = ABORT,
   červeno-bílé blikání = NEZAŽEHL.
 
+### Bezpečnostní spínač otočený servem (dálkové odjištění)
+
+Pyro napájení (J4) jde přes **dva spínače v sérii**: klíč, který sepne poslední člověk odcházející od rampy, a
+spínač, kterým otočí **servo** (J12) až na povel z dálky. Rampa měří napětí až za oběma spínači („klíč“).
+
+* Zapnutí: Rampa Console → *Serva* → vyber servo, nastav polohy SAFE/ARM (µs), *Zapsat*, pak **ARMTEST**
+  (rozbuška odpojená) – rampa ukáže, za kolik ms klíč sepnul. Bez nastaveného serva vše funguje jen s klíčem.
+* **Kdy servo sepne:** jen na povel k odjištění a jen když je vše ostatní v pořádku –
+  test motoru: **ARM** ze stanice (LoRa rampy); raketa na pogu: **PREPARE** (Zenith READY / Ariadna „launch soon“,
+  raketa ho opakuje 20×/s, rampa je READY, až když klíč opravdu sepne). Když klíč do `arm_settle_ms` nesepne
+  (lidský klíč vypnutý, servo špatně nastavené), servo se vrátí a rampa hlásí chybu klíče; u rakety se znovu
+  nezkouší, dokud raketa nepošle PING (SAFE / DISARM).
+* **Kdy servo rozepne:** SAFE / DISARM / ABORT / PING, **hned po pulzu do rozbušky**, ztráta rakety nebo stanice,
+  a vždy, když už nic nedrží rampu odjištěnou (u rakety bez povelu 1,5 s).
+* ⚠ Serva na J12 jsou napájená přímo z baterie (2S, až 8,4 V) – použij **HV servo**. Ručně lze servy hýbat z
+  Rampa Console (záložka *Serva*); servo bezpečnostního spínače jen když nic není odjištěné a samo se vrátí do SAFE.
+
 ### Diagnostické GUI (`gui/rampa_diag.py`, USB)
 
 Design VoltinoLabs (jako konzole Daidalosu): přehled napájení, pyro výstupů, rakety/spojení a měřicího jádra,
 kontrola „proč nejde zapálit“, živý tah/tlak/teploty, kalibrace (TARE, závaží, katalog snímače, nula a rozsah
 tlakového čidla, termistory, všechny parametry), záznamy na flash (stažení v plné frekvenci, statistika, třída
-motoru, CSV + BIN), konzole. `python gui/rampa_diag.py --demo` běží bez hardwaru. Zapálit z něj nejde.
+motoru, CSV + BIN), **serva** (4 kanály, bezpečnostní spínač, ARMTEST), konzole. `python gui/rampa_diag.py --demo` běží bez hardwaru. Zapálit z něj nejde.
 
 ### Zkoušky před prvním zážehem
 

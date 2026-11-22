@@ -25,7 +25,8 @@ neaktivní, jinak `sl_state_t`), flags (`SL_F_*`), faults (`SL_FLT_*`), vbat_mV,
 blokování pro raketu (`ZL_RMPF_*`), klíč, tlačítko, LoRa, režim test, ADS OK, flash OK, vzorků/s, poslední
 test, volno kB, celkem kB, počet záznamů, záznamník (0 nečinný, 1 maže, 2 připraven, 3 zaznamenává),
 průběh %, t_rel_ms, rozbuška, puls ms, záznam s, stáří paketu stanice ms (−1 nikdy), jádro 1 OK, JEDEC,
-RSSI, ztracené vzorky, fw.
+RSSI, ztracené vzorky, fw, puls serv 1–4 µs (0 = nedrží), servo bezpečnostního spínače (0 = žádné),
+stav spínače (0 SAFE, 1 ARMING, 2 ARMED, 3 selhalo, 4 zkouška polohy), za kolik ms naposledy sepnul klíč.
 
 ## Příkazy
 
@@ -44,6 +45,8 @@ RSSI, ztracené vzorky, fw.
 | `LIST` / `DUMP <n>` | záznamy na flash, stažení |
 | `ERASEALL YES` | smaže všechny záznamy (kalibrace zůstane) |
 | `BUZZER 0\|1` | bzučák |
+| `SERVO <1-4> <500-2500>` / `SERVO <1-4> OFF` | pohne servem / přestane ho držet. Servo bezpečnostního spínače jen když nic není odjištěné, mimo polohu SAFE se samo vrátí za 10 s, uvolnit ho nejde |
+| `ARMTEST` | servo spínače do ARM, změří za kolik ms sepne klíč (`#OK ARMTEST …` / `#ERR ARMTEST …`), za 3 s zpět do SAFE; bez rakety a jen zajištěné |
 | `STAND 1\|0` | režim test motoru zap / vyp (bez rakety) |
 | `DISARM` / `ABORT` | test motoru: zpět do SAFE / přerušit |
 
@@ -63,11 +66,15 @@ Kalibrace a `SET` jdou jen když rampa není odjištěná, neodpočítává a ne
 | `fire_ms` / `pyro_ch` / `cd_s` | 1000 / 1 / 10 | výchozí puls, rozbuška, odpočet (stanice je posílá v povelu) |
 | `rec_s` | 20 | záznam po T-0 |
 | `rate_2k` | 1 | 1 = 2000 S/s (ADS1220 turbo), 0 = 1000 S/s |
+| `arm_servo` | 0 | servo (1–4) bezpečnostního spínače v sérii s klíčem J4; 0 = jen klíč |
+| `arm_us` / `safe_us` | 2000 / 1000 | puls serva: spínač sepnut / rozepnut |
+| `arm_settle_ms` | 1500 | do kdy po natočení musí klíč sepnout, jinak servo zpět a chyba klíče |
 
 ## Záznam na flash (W25Q128, `thrust_stand.h`)
 
 ```
-0x000000 / 0x001000   konfigurace A / B (novější platná kopie vyhrává – výpadek napájení nevadí)
+0x000000 / 0x001000   konfigurace A / B (novější platná kopie vyhrává – výpadek napájení nevadí;
+                      verze 1 bez serva se při startu převede na verzi 2, kalibrace zůstane)
 0x010000 …            záznamy, každý od hranice 64 KB:
     +0    hlavička 128 B  ts_hdr_t  ("RTS1", test, bloky, S/s, druh, rozbuška, puls, napětí 5V, kopie konfigurace, CRC16)
     +128  patička  128 B  ts_end_t  ("END1", počet vzorků, vzorek T-0, výsledky, ztracené vzorky, CRC16)

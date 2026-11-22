@@ -63,7 +63,7 @@ w.resize(1536, 900)
 w.show()
 check(wait_for(app, lambda: bool(w.s) and bool(w.m), 3), "$S and $M parsed")
 check(wait_for(app, lambda: "lc_scale" in w.cfg, 2), "configuration read ($CFG)")
-check(w.cfg_tab.rowCount() == 17, f"parameter table has 17 rows ({w.cfg_tab.rowCount()})")
+check(w.cfg_tab.rowCount() == 21, f"parameter table has 21 rows ({w.cfg_tab.rowCount()})")
 check(wait_for(app, lambda: w.rec_tab.rowCount() == 1, 3), "LIST: 1 record")
 check(wait_for(app, lambda: "ADS1220: 2000" in w.chips["ads"].text(), 2), "chip " + w.chips["ads"].text())
 
@@ -94,13 +94,27 @@ if w.rec:
 files = os.listdir(os.environ["RAMPA_DATA"])
 check(any(f.endswith(".csv") for f in files) and any(f.endswith(".bin") for f in files), f"CSV + BIN saved ({files})")
 if OUT:
-    w.tabs.setCurrentIndex(3)
+    w.tabs.setCurrentIndex(4)
     wait_for(app, lambda: False, 0.3)
     w.grab().save(os.path.join(OUT, "rampa_records.png"))
-    for i, n in ((0, "overview"), (1, "measure"), (2, "calib")):
+    for i, n in ((0, "overview"), (1, "measure"), (2, "calib"), (3, "servos")):
         w.tabs.setCurrentIndex(i)
         wait_for(app, lambda: False, 0.3)
         w.grab().save(os.path.join(OUT, f"rampa_{n}.png"))
+
+print("== servos and the arming switch")
+check(wait_for(app, lambda: "J12" in w.sv_rows[0][1].text() or "drží" in w.sv_rows[0][1].text(), 2), "servo 1 row: " + w.sv_rows[0][1].text())
+check(w.as_cb.currentIndex() == 1, "arming servo 1 read from $CFG")
+w._servo(1, 1300)
+check(wait_for(app, lambda: rd.to_i(w.s.get("sv2")) == 1300, 2), "servo 2 moved to 1300 us")
+w.send("SERVO 2 OFF")
+check(wait_for(app, lambda: rd.to_i(w.s.get("sv2")) == 0, 2), "servo 2 released")
+w.send("ARMTEST")
+check(wait_for(app, lambda: "#OK ARMTEST key closed" in w.log.toPlainText(), 3), "ARMTEST ok")
+check(wait_for(app, lambda: "SEPNUT" in w.as_vals["key"].text(), 2), "key shown closed during the test")
+w.as_settle.setValue(2000)
+w.write_arm_servo()
+check(wait_for(app, lambda: w.cfg.get("arm_settle_ms") == "2000" and not w._q, 3), "arming servo settings written")
 
 print("== cold recording")
 w.send("REC 1")

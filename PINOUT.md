@@ -29,7 +29,9 @@ rampa_pcb1: # Raspberry Pi Pico 2 (U7), sketch Rampa_MCU/Rampa_MCU.ino
                     AIN3: "THERM2 J11 (R49 10k to GND)", REFP0_AVDD: "5V_SENS (excitation, ratiometric)", clk: internal}
   pressure_adc:    {pin: "GP26 / ADC0", net: PRESSURE, from: "J9.2 via R46 4k7, R47 10k to GND (x0.680), D6A/D6B clamp, C38 47n",
                     supply: "J9.1 = 5V_SENS (measured on ADS1115 AIN3 = 5V_SENS/2)"}
-  unused_by_fw:    {servos: "GP27 (J12.1), GP28 (J12.4), GP14 (J12.7), GP22 (J12.10)", umb2_uart1: "GP8 TX / GP9 RX (J14)"}
+  servos_J12:      {s1: "GP27 (J12.1)", s2: "GP28 (J12.4)", s3: "GP14 (J12.7)", s4: "GP22 (J12.10)", power: "VBAT 2S (HV servo!)",
+                    arm_servo: "SET arm_servo 1-4: closes the 2nd switch in series with the key J4"}
+  unused_by_fw:    {umb2_uart1: "GP8 TX / GP9 RX (J14)"}
 ```
 
 | Pin | Funkce | Síť / periférie |
@@ -46,6 +48,6 @@ rampa_pcb1: # Raspberry Pi Pico 2 (U7), sketch Rampa_MCU/Rampa_MCU.ino
 | GP15 / GP21 | CS / DRDY ADS1220 | tenzometr J8, termistory J10 / J11 |
 | GP26 | ADC0 | tlakové čidlo J9 (dělič 4k7 / 10k) |
 | GP8 / GP9 | UART1 (druhé pogo J14) | firmware nepoužívá |
-| GP27 / GP28 / GP14 / GP22 | serva J12 | firmware nepoužívá |
+| GP27 / GP28 / GP14 / GP22 | serva 1–4 (J12) | ovládání z Rampa Console; jedno může točit bezpečnostním spínačem v sérii s klíčem |
 
-Zážeh vyžaduje současně: klíč J4 sepnutý + GP19 HIGH + GPx HIGH.
+Zážeh vyžaduje současně: klíč J4 sepnutý (s bezpečnostním servem: lidský klíč **a** spínač otočený servem v sérii) + GP19 HIGH + GPx HIGH.
