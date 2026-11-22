@@ -1,8 +1,22 @@
-# RampaCode — firmware rampy (Rampa PCB1) pro raketu Zenith
+# RampaCode — firmware rampy (Rampa PCB1) pro **Zenith i Daidalos**
 
-Řídicí jednotka startovací rampy: napájí raketu po pogo konektoru, mluví s ní po UARTu,
-drží synchronizovaný odpočet a v T-0 zažehne motor — jen pokud raketa i rampa jsou
-v tu chvíli stále v pořádku.
+Řídicí jednotka startovací rampy: drží synchronizovaný odpočet s raketou na pogo
+konektoru a v T-0 zažehne motor — jen pokud raketa i rampa jsou v tu chvíli stále v pořádku.
+
+**Jeden firmware pro obě rakety, bez přenahrávání.** Rampa sama pozná, kdo je na pogu:
+
+| Raketa | Protokol na GP0/GP1 (J3.4/J3.3) | UMB_5V | Hlavička |
+|---|---|---|---|
+| **Zenith** (Zenith v2.4) | UART0 115200, raketa = master | **zapnuto** (napájí raketu) | `zenith_link.h` |
+| **Daidalos** (Ariadna V2, Navigation MCU `I2CN`) | I²C0 slave `0x2B`, 100 kHz | **vypnuto** (svazek Ariadny pin 2 nezapojuje) | `ariadna_rampa_link.h` (kopie z Daidalos `Ariadna_V2/common`, fw 3.34) |
+
+Rozpoznání: po zapnutí rampa 1.5 s poslouchá jako I²C slave s vypnutým UMB_5V; pak UMB_5V
+zapne a střídá 600 ms I²C / 600 ms UART. První rámec, který projde magic + CRC svého
+protokolu, protokol zamkne (drží se, dokud rámce chodí, a vždy po celý odpočet a zážeh;
+po 3 s ticha se rampa vrátí k hledání). Pro Ariadnu se chová přesně jako původní
+`Rampa_MCU.ino` z Daidalosu (PING ruší ABORT, příkaz DETACH, odpověď COMMITTED ve stejné
+I²C transakci — Ariadna na ni čeká jen 25 ms — a odpojení pinů do Hi-Z před T-0).
+RGB: modrá = Zenith, azurová = Daidalos, blikající modrá = hledá raketu.
 
 * Hardware: **Rampa PCB1** (stejná deska a pinout jako rampa Daidalosu, Raspberry Pi Pico 2) — [PINOUT.md](PINOUT.md)
 * Sketch: [`Rampa_MCU/Rampa_MCU.ino`](Rampa_MCU/Rampa_MCU.ino), board **Raspberry Pi Pico 2** (`rp2040:rp2040:rpipico2`, jádro arduino-pico ≥ 6.4)
@@ -11,13 +25,16 @@ v tu chvíli stále v pořádku.
   z repozitáře [Zenith-flight-computer](https://github.com/Tomasraketak/Zenith-flight-computer)
   (kontrola/aktualizace: `python3 tools/sync_common.py --fix` v tom repozitáři, když jsou repa vedle sebe).
 
-> Kompiluje se (arduino-pico 6.4.0), na hardwaru zatím neodzkoušeno.
+> Kompiluje se (arduino-pico 6.4.0). `make -C test` spustí **skutečný** `Rampa_MCU.ino` na PC
+> (Arduino API nahrazené v `test/stubs`) proti simulované Ariadně (I²C) a Zenithu (UART):
+> rozpoznání, READY, odpočet, COMMIT, zážeh v T-0 ±5 ms, ABORT tlačítkem / ztrátou GO /
+> vytažením poga. Na hardwaru zatím neodzkoušeno.
 
 ## Jak funguje
 
 | Situace | Rampa |
 |---|---|
-| **Raketa na pogu** (rámce od rakety < 1.5 s) | LoRa rampy **vypnuté** (TCA9534 P4 → U12), na každý příkaz rakety odpoví stavem; vše ze země jde přes LoRa rakety |
+| **Raketa na pogu** (Zenith nebo Daidalos) | LoRa rampy **vypnuté** (TCA9534 P4 → U12), na každý příkaz rakety odpoví stavem; vše ze země jde přes LoRa rakety |
 | **Bez rakety** | po 2 s zapne LoRa a 1× za s vysílá beacon (baterie, klíč, kontinuita, proud do poga); ve stejných 10 s oknech jako raketa přijímá: napájení rakety ZAP/VYP, ABORT, SAFE, bzučák |
 | **Po zážehu** | 30 min nechává rádio vypnuté (pásmo patří letící raketě) |
 
@@ -37,12 +54,12 @@ lokální tlačítko SW1, jakákoli chyba blokování, chybějící COMMIT. ABOR
 
 ### Pogo umbilical
 
-| Rampa J3 | | Zenith J1 |
+| Rampa J3 | Zenith J1 | Daidalos (Ariadna `I2CN`) |
 |---|---|---|
-| 1 GND | — | 1 GND |
-| 2 UMB_5V (TCA9534 P1 `ROCKET_EN`) | → | 2 5V |
-| 3 → R22 100R → **GP1 (UART0 RX)** | ← | 3 TX |
-| 4 ← R21 1k ← **GP0 (UART0 TX)** | → | 4 RX |
+| 1 GND | 1 GND | 1 GND |
+| 2 UMB_5V (TCA9534 P1 `ROCKET_EN`) | 2 5 V vstup | **nezapojeno** (rampa ho pro Ariadnu nezapne) |
+| 3 → R22 100R → **GP1** (UART0 RX / I²C0 SCL) | 3 TX | NSCL |
+| 4 ← R21 1k ← **GP0** (UART0 TX / I²C0 SDA) | 4 RX | NSDA |
 
 UART 115200 8N1, rámce `0x5A 0xE7 TYPE LEN payload CRC16`; raketa = master
 (`ZL_PKT_RMP_CMD` 12 B), rampa odpovídá `ZL_PKT_RMP_STATUS` 20 B.

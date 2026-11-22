@@ -1,13 +1,15 @@
 # Rampa PCB1 — pinout (RampaNetlist_PCB1_2026-11-19)
 
-Stejná deska jako rampa Daidalosu; jediná změna proti Daidalosu: pogo umbilical (J3) se
-používá jako **UART0** místo I²C slave (GP0 = UART0 TX, GP1 = UART0 RX — RP2350 má na
-těchto pinech obojí).
+Stejná deska jako rampa Daidalosu. Pogo umbilical (J3) je podle připojené rakety buď
+**UART0** (Zenith: GP0 = TX, GP1 = RX) nebo **I²C0 slave 0x2B** (Daidalos/Ariadna: GP0 = SDA,
+GP1 = SCL) — RP2350 má na těchto pinech obojí a firmware přepíná sám.
 
 ```yaml
 rampa_pcb1: # Raspberry Pi Pico 2 (U7), sketch Rampa_MCU/Rampa_MCU.ino
-  uart0_umbilical: {tx: "GP0 -> R21 1k -> J3.4", rx: "GP1 <- R22 100R <- J3.3 (R23 100k PU)", baud: 115200,
-                    peer: "Zenith J1 pin3 TX -> J3.3, pin4 RX <- J3.4"}
+  umbilical_J3:    {gp0: "R21 1k -> J3.4", gp1: "R22 100R <- J3.3 (R23 100k PU)",
+                    zenith:  {mode: "UART0 115200", gp0: TX, gp1: RX, umb_5v: on},
+                    ariadna: {mode: "I2C0 slave 0x2B 100 kHz", gp0: SDA, gp1: SCL, umb_5v: off, detach: "Hi-Z after COMMITTED"},
+                    detect: "1.5 s I2C (UMB_5V off), then 600 ms I2C / 600 ms UART until a valid frame locks"}
   i2c1_internal:   {sda: GP6, scl: GP7, clk_khz: 400, pullup: "R18/R19 4.7k",
                     devs: {tca9534: 0x20, ina226_vbat: 0x40, ina226_umb5v: 0x41, ads1115: 0x48}}
   tca9534_0x20:    {P0: "BUZZER_EN out H", P1: "ROCKET_EN out H (UMB_5V buck U2 = napajeni rakety)",
@@ -25,8 +27,8 @@ rampa_pcb1: # Raspberry Pi Pico 2 (U7), sketch Rampa_MCU/Rampa_MCU.ino
 
 | Pin | Funkce | Síť / periférie |
 |---|---|---|
-| GP0 | UART0 TX → raketa | `UMB_TX` → R21 1 kΩ → J3.4 |
-| GP1 | UART0 RX ← raketa | `UMB_RX` ← R22 100 Ω ← J3.3 (R23 100 kΩ PU) |
+| GP0 | UART0 TX (Zenith) / I²C0 SDA (Daidalos) | `UMB_TX` → R21 1 kΩ → J3.4 |
+| GP1 | UART0 RX (Zenith) / I²C0 SCL (Daidalos) | `UMB_RX` ← R22 100 Ω ← J3.3 (R23 100 kΩ PU) |
 | GP6 / GP7 | I2C1 SDA / SCL | TCA9534 `0x20`, INA226 `0x40` (VBAT), INA226 `0x41` (UMB_5V), ADS1115 `0x48` |
 | GP10–GP13 | SPI1 SCK/MOSI/MISO/CS | Ra-02 LoRa (napájení přes U12) |
 | GP16 / GP17 / GP18 | zážeh kanálu 1 / 2 / 3 | Q22 / Q23 / Q24 → J5 / J6 / J7 |

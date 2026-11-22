@@ -1,33 +1,43 @@
 // =====================================================================
-//  RAMPA PCB1 — launch pad controller for the ZENITH rocket
+//  RAMPA PCB1 — launch pad controller for ZENITH *and* DAIDALOS (Ariadna V2)
 //
-//  Target: Raspberry Pi Pico 2 (RP2350, U7), arduino-pico core
-//          (rp2040:rp2040:rpipico2). Needs: LoRa (sandeepmistry), Adafruit NeoPixel.
-//  Hardware and pinout are exactly the Daidalos/Ariadna Rampa PCB1
-//  (RampaNetlist_PCB1_2026-11-19.enet) — see ../PINOUT.md.
+//  ONE firmware, no reflashing: the rampa recognises by itself which rocket
+//  is on the pogo umbilical and speaks its protocol.
+//
+//    Zenith  (zenith_link.h)        UART0 115200 on GP0 (TX) / GP1 (RX),
+//                                   rocket = master, 20 Hz command/status frames,
+//                                   rampa powers the rocket over UMB_5V.
+//    Ariadna (ariadna_rampa_link.h) I2C0 slave 0x2B on GP0 (SDA) / GP1 (SCL),
+//                                   Navigation MCU = I2C master @ 100 kHz, 20 Hz,
+//                                   UMB_5V stays OFF (the Ariadna harness leaves
+//                                   pin 2 unconnected), hot-detach at COMMIT —
+//                                   exactly the behaviour of the Daidalos
+//                                   Rampa_MCU.ino (fw 3.34).
+//
+//  Target: Raspberry Pi Pico 2 (RP2350, U7), arduino-pico (rp2040:rp2040:rpipico2).
+//  Needs : LoRa (sandeepmistry), Adafruit NeoPixel.
 //
 //  ---------------------------------------------------------------------
-//  WHAT IT DOES
+//  HOW THE ROCKET IS RECOGNISED
 //  ---------------------------------------------------------------------
-//  * Powers the rocket on the pad through the pogo umbilical (UMB_5V,
-//    TCA9534 P1 ROCKET_EN) and talks to it over the same pogo pins as a
-//    UART (115200 Bd):
-//        J3.4  <- R21 1k  <- GP0 (UART0 TX)  -> rocket RX (Zenith J1.4)
-//        J3.3  -> R22 100R-> GP1 (UART0 RX)  <- rocket TX (Zenith J1.3)
-//    The ROCKET is the master: it sends a command frame every 50 ms and the
-//    rampa answers each one with its status (zenith_link.h, ZL_PKT_RMP_*).
-//  * While the rocket keeps talking (< 1.5 s), the rampa's own LoRa radio is
-//    powered OFF (TCA9534 P4 -> U12) and everything goes through the rocket.
-//    With NO rocket on the pogo the rampa switches its radio on, sends a
-//    1 Hz beacon to the ground station and listens in the same 10 s TDMA
-//    windows as the rocket would (rocket power on/off, abort/safe, locate).
-//  * Countdown: the rocket sends ms-to-T-0 in every frame; the rampa locks
-//    its own T-0 to it, keeps checking the rocket's GO flag and its own
-//    interlocks (key, igniter continuity, battery, abort button), accepts a
-//    COMMIT in the last 300 ms and fires the motor igniter at T-0 —
-//    only if everything is still OK at that very moment.
-//  * Abort sources: rocket ABORT, rocket GO flag dropped, rocket silent for
-//    1.5 s during the countdown, local abort button, interlock fault.
+//  GP0/GP1 can be UART0 or I2C0 on the RP2350, and both rockets use the
+//  same pogo pins (J3.3 / J3.4). While nobody is locked in, the rampa
+//  listens alternately 600 ms as an I2C slave and 600 ms as a UART. The
+//  first frame that passes its protocol's magic + CRC locks that protocol;
+//  it stays locked while frames keep coming (and always through a countdown
+//  and firing). Neither protocol can be mistaken for the other: a UART byte
+//  stream never produces an I2C START (SDA is not driven by the rocket in
+//  UART mode), and I2C traffic seen by the UART is framing garbage that
+//  fails the 0x5A 0xE7 sync + CRC-16.
+//
+//  At power-up the rampa first listens 1.5 s as an I2C slave with the
+//  rocket supply OFF. Only if no Ariadna answers does it switch UMB_5V on
+//  (a Zenith with its battery switched off needs it to boot).
+//
+//  Ariadna expects the COMMITTED answer in the SAME I2C transaction as its
+//  COMMIT write (25 ms timeout), so Ariadna commands are processed directly
+//  in the I2C receive interrupt; the main loop does its own state changes
+//  with interrupts masked, so the two never interleave.
 // =====================================================================
 #include <Arduino.h>
 #include <Wire.h>
@@ -36,12 +46,13 @@
 #include <Adafruit_NeoPixel.h>
 #include "hardware/watchdog.h"
 #include "zenith_link.h"
+#include "ariadna_rampa_link.h"
 
 // =====================================================================
 //  1. PINOUT (RampaNetlist_PCB1_2026-11-19.enet)
 // =====================================================================
-static const uint8_t PIN_UMB_TX     = 0;   // U7.1  -> R21 1k   -> J3.4
-static const uint8_t PIN_UMB_RX     = 1;   // U7.2  <- R22 100R <- J3.3 (R23 100k pull-up)
+static const uint8_t PIN_UMB_0      = 0;   // U7.1  -> R21 1k   -> J3.4   (UART0 TX | I2C0 SDA)
+static const uint8_t PIN_UMB_1      = 1;   // U7.2  <- R22 100R <- J3.3   (UART0 RX | I2C0 SCL), R23 100k PU
 static const uint8_t PIN_INT_SDA    = 6;   // I2C1 internal bus (R18 4.7k)
 static const uint8_t PIN_INT_SCL    = 7;   //                   (R19 4.7k)
 static const uint8_t PIN_LORA_SCK   = 10;  // SPI1 -> M1 Ra-02 (via 1k)
@@ -67,47 +78,72 @@ static const uint8_t EXP_FIRE_LED   = 1u << 6;  // OUT H = red light
 static const uint8_t EXP_BTN        = 1u << 7;  // IN  L = local abort pressed
 
 // =====================================================================
-//  2. SAFETY CONSTANTS
+//  2. CONSTANTS
 // =====================================================================
-static const uint16_t VBAT_MIN_MV      = 6600;  // 2S
-static const uint16_t CONT_MIN_MV      = 350;   // ADS1115 CONTx threshold
-static const uint32_t POST_FIRE_MS     = 8000;  // FIRED -> IDLE after this if nobody says otherwise
-static const bool     ROCKET_PWR_BOOT  = true;  // power the rocket over the pogo at boot
-static const uint32_t ROCKET_LINK_MS   = ZL_RMP_TIMEOUT_MS;
-static const uint32_t RADIO_QUIET_AFTER_FIRE_MS = 30UL * 60UL * 1000UL;  // rocket is flying: keep the band free
+static const uint16_t VBAT_MIN_MV      = 6600;   // 2S
+static const uint16_t CONT_MIN_MV      = 350;    // ADS1115 CONTx threshold
+static const uint32_t POST_FIRE_MS     = 5000;   // FIRED -> IDLE (as Daidalos RAMPA_POST_FIRE_MS)
+static const uint16_t ARIADNA_FIRE_MS  = 1000;   // Daidalos RAMPA_FIRE_PULSE_MS
+static const uint32_t LINK_TIMEOUT_MS  = 1500;   // both protocols
+static const uint32_t UNLOCK_MS        = 3000;   // forget the protocol after this much silence
+static const uint32_t SCAN_SLOT_MS     = 600;    // alternate I2C / UART listening
+static const uint32_t BOOT_I2C_MS      = 1500;   // first listen for Ariadna with UMB_5V off
+static const uint16_t UMB_OVERCURRENT  = 2500;   // mA on UMB_5V -> switch it off
+static const uint32_t RADIO_QUIET_AFTER_FIRE_MS = 30UL * 60UL * 1000UL;
+
+enum Proto : uint8_t { P_NONE = 0, P_ZENITH = 1, P_ARIADNA = 2 };
+enum Port  : uint8_t { PORT_OFF = 0, PORT_UART = 1, PORT_I2C = 2 };
 
 // =====================================================================
-//  3. STATE
+//  3. STATE  (volatile: touched by the I2C slave interrupt too)
 // =====================================================================
 static Adafruit_NeoPixel s_rgb(1, PIN_RGB, NEO_GRB + NEO_KHZ800);
 static zl_rx_t  s_rx;
 
-static uint8_t  s_state = ZR_ST_IDLE;
-static uint8_t  s_faults = 0;          // live interlock faults
-static uint8_t  s_latched = 0;         // faults that caused an ABORT (kept until SAFE)
-static uint8_t  s_flags = 0;
-static uint8_t  s_last_seq = 0;
-static uint8_t  s_pyro_ch = 1;
-static uint16_t s_fire_ms = 1000;
+static volatile uint8_t  s_proto = P_NONE;
+static volatile uint8_t  s_port = PORT_OFF;
+static volatile uint8_t  s_state = ZR_ST_IDLE;     // numerically identical to RAMPA_STATE_*
+static volatile uint8_t  s_faults = 0;             // live interlock faults (same bits in both protocols)
+static volatile uint8_t  s_latched = 0;            // faults that caused an ABORT
+static volatile uint8_t  s_flags = 0;              // Zenith-format flags (ZL_RMP_*)
+static volatile uint8_t  s_last_seq = 0;
+static volatile uint8_t  s_pyro_ch = 1;
+static volatile uint16_t s_fire_ms = 1000;
+static volatile uint8_t  s_rocket_go = 0;
+static volatile uint32_t s_last_cmd_ms = 0;
+static volatile bool     s_cd = false;
+static volatile uint32_t s_t0_ms = 0;
+static volatile uint32_t s_fire_end_ms = 0, s_fired_ms = 0;
+static volatile bool     s_detach_req = false;     // Ariadna: float GP0/GP1 after the COMMITTED read
+static volatile uint32_t s_evt = 0;                // events to print from the main loop
 
 static uint8_t  s_exp_out = 0;
 static bool     s_exp_ok = false, s_ina_ok = false, s_ads_ok = false;
-static uint16_t s_vbat_mv = 0, s_umb_ma = 0;
-static uint16_t s_cont_mv[3] = { 0, 0, 0 };
-static bool     s_key = false, s_btn = false;
-static bool     s_rocket_pwr = ROCKET_PWR_BOOT;
+static volatile uint16_t s_vbat_mv = 0, s_umb_ma = 0;
+static volatile uint16_t s_cont_mv[3] = { 0, 0, 0 };
+static volatile bool     s_key = false, s_btn = false;
+static bool     s_rocket_pwr = true;               // user wish (GS command); actual output also needs proto
+static bool     s_umb_trip = false;
 
-static uint32_t s_last_cmd_ms = 0;     // last valid frame from the rocket
-static bool     s_rocket_present = false;
-static uint8_t  s_rocket_flags = 0;
-
-static bool     s_cd = false;
-static uint32_t s_t0_ms = 0;
-static uint32_t s_fire_end_ms = 0, s_fired_ms = 0;
+static bool     s_detached = false;
+static uint32_t s_detach_ms = 0;
+static uint32_t s_scan_slot_ms = 0;
+static uint32_t s_boot_ms = 0;
 
 static bool     s_lora_on = false;
 static uint8_t  s_ul_seq = 0, s_ul_rc = ZL_RC_NONE;
 static bool     s_locate = false;
+
+static uint8_t  s_i2c_tx[ARIADNA_RAMPA_STAT_SIZE];  // Ariadna status served from the ISR
+
+#define EVT_ABORT     (1u << 0)
+#define EVT_COMMIT    (1u << 1)
+#define EVT_FIRE      (1u << 2)
+#define EVT_LOCK_Z    (1u << 3)
+#define EVT_LOCK_A    (1u << 4)
+#define EVT_UNLOCK    (1u << 5)
+#define EVT_DETACH    (1u << 6)
+#define EVT_UMB_TRIP  (1u << 7)
 
 // =====================================================================
 //  4. INTERNAL I2C1 (TCA9534, INA226 x2, ADS1115)
@@ -140,7 +176,7 @@ static void exp_write(uint8_t out)
 }
 static bool exp_begin(void)
 {
-    s_exp_out = s_rocket_pwr ? EXP_ROCKET_EN : 0;              // LoRa off, buzzer off, light off
+    s_exp_out = 0;                                     // everything off, rocket supply OFF until we know
     bool ok = i2c_w8(ADDR_TCA, 0x01, s_exp_out);
     ok = ok && i2c_w8(ADDR_TCA, 0x03, (uint8_t)(EXP_KEY | EXP_LORA_DIO0 | EXP_BTN));
     s_exp_ok = ok;
@@ -181,7 +217,7 @@ static void sensors_update(uint32_t now)
 }
 
 // =====================================================================
-//  5. PYROS
+//  5. INTERLOCKS & COMMON STATE MACHINE (called from loop and from the I2C ISR)
 // =====================================================================
 static void pyro_off(void)
 {
@@ -196,8 +232,7 @@ static void compute_flags(void)
     for (int i = 0; i < 3; i++) if (s_cont_mv[i] >= CONT_MIN_MV) f |= (uint8_t)(ZL_RMP_CONT1 << i);
     if (digitalRead(PIN_PYRO_ARM)) f |= ZL_RMP_PYRO_ARMED;
     if (!s_lora_on) f |= ZL_RMP_LORA_OFF;
-    if (s_rocket_pwr) f |= ZL_RMP_ROCKET_PWR;
-
+    if (s_exp_out & EXP_ROCKET_EN) f |= ZL_RMP_ROCKET_PWR;
     uint8_t fm = 0;
     if (!s_exp_ok || !s_ina_ok || !s_ads_ok) fm |= ZL_RMPF_HW;
     if (s_vbat_mv < VBAT_MIN_MV) fm |= ZL_RMPF_LOW_VBAT;
@@ -216,62 +251,63 @@ static void enter_abort(uint8_t why)
     s_cd = false;
     s_latched |= why;
     s_state = ZR_ST_ABORT;
-    Serial.printf("ABORT faults 0x%02X\n", s_latched | s_faults);
+    s_evt |= EVT_ABORT;
 }
 
-// =====================================================================
-//  6. UMBILICAL (rocket is the master)
-// =====================================================================
-static void send_status(uint32_t now)
+/**
+ * One command from either rocket. The command numbers 0..4 mean the same in
+ * both protocols (PING, PREPARE, COUNTDOWN, COMMIT, ABORT); 5 is SAFE (Zenith)
+ * or DETACH (Ariadna). Where Daidalos' rampa behaved differently, the Ariadna
+ * branch reproduces it.
+ */
+static void rampa_cmd(uint8_t proto, uint8_t cmd, uint8_t seq, int32_t t_rem, bool go,
+                      uint8_t pyro_ch, uint16_t fire_ms, uint32_t rx_ms)
 {
-    zl_rmp_status_t st = {};
-    st.t_rem_ms = s_cd ? (int32_t)(s_t0_ms - now) : -1;
-    st.vbat_mv = s_vbat_mv;
-    st.umb_ma = s_umb_ma;
-    memcpy(st.cont_mv, s_cont_mv, sizeof st.cont_mv);
-    st.state = s_state;
-    st.flags = s_flags;
-    st.faults = (uint8_t)(s_faults | s_latched);
-    st.last_seq = s_last_seq;
-    st.fw = (uint8_t)(ZENITH_FW_VERSION & 0xFF);
-    uint8_t f[ZL_FRAME_MAX];
-    const uint16_t n = zl_encode(f, ZL_PKT_RMP_STATUS, &st, sizeof st);
-    if (Serial1.availableForWrite() >= (int)n) Serial1.write(f, n);
-}
-
-static void handle_rocket(const zl_rmp_cmd_t &c, uint32_t rx_ms)
-{
-    s_last_seq = c.seq;
+    s_last_seq = seq;
     s_last_cmd_ms = rx_ms ? rx_ms : 1;
-    s_rocket_flags = c.rocket_flags;
-    if (c.pyro_ch >= 1 && c.pyro_ch <= 3 && s_state != ZR_ST_COMMITTED && s_state != ZR_ST_FIRED) s_pyro_ch = c.pyro_ch;
-    if (c.fire_ms >= 50 && c.fire_ms <= 5000) s_fire_ms = c.fire_ms;
+    s_rocket_go = go;
+    if (pyro_ch >= 1 && pyro_ch <= 3 && s_state != ZR_ST_COMMITTED && s_state != ZR_ST_FIRED) s_pyro_ch = pyro_ch;
+    if (fire_ms >= 50 && fire_ms <= 5000) s_fire_ms = fire_ms;
     compute_flags();
-    const bool go = (c.rocket_flags & ZL_RK_GO) != 0;
-    // frame travelled ~1.7 ms (20 B @ 115200) after the rocket stamped t_rem
-    const int32_t t_rem = c.t_rem_ms > 0 ? c.t_rem_ms - 2 : c.t_rem_ms;
+    const bool ariadna = proto == P_ARIADNA;
 
-    switch (c.cmd) {
+    switch (cmd) {
     case ZR_CMD_ABORT:
         if (s_state != ZR_ST_FIRED) enter_abort(0);
         break;
-    case ZR_CMD_SAFE:
-        pyro_off(); s_cd = false; s_latched = 0;
-        if (s_state != ZR_ST_FIRED || (uint32_t)(rx_ms - s_fired_ms) > 2000u) s_state = ZR_ST_IDLE;
+
+    case 5:
+        if (ariadna) {                                   // RAMPA_CMD_DETACH
+            pyro_off(); s_cd = false; s_state = ZR_ST_IDLE; s_detach_req = true;
+        } else {                                         // ZR_CMD_SAFE
+            pyro_off(); s_cd = false; s_latched = 0;
+            if (s_state != ZR_ST_FIRED || (uint32_t)(rx_ms - s_fired_ms) > 2000u) s_state = ZR_ST_IDLE;
+        }
         break;
+
     case ZR_CMD_PING:
-        if (s_state == ZR_ST_ABORT) break;                 // abort is latched until SAFE
-        if (s_state == ZR_ST_FIRED && s_fire_end_ms) break;
-        pyro_off(); s_cd = false;
-        s_state = s_faults ? ZR_ST_FAULT : ZR_ST_IDLE;
-        if (s_faults == ZL_RMPF_NO_CONT || s_faults == ZL_RMPF_NO_KEY || s_faults == (ZL_RMPF_NO_CONT | ZL_RMPF_NO_KEY))
-            s_state = ZR_ST_IDLE;                          // normal while the pad is being set up
+        if (s_state == ZR_ST_FIRED) break;
+        if (ariadna) {
+            // Daidalos: a PING clears TIMEOUT/ROCKET/CLOCK and re-evaluates (also out of ABORT)
+            pyro_off(); s_cd = false;
+            s_latched &= (uint8_t)~(ZL_RMPF_TIMEOUT | ZL_RMPF_ROCKET | ZL_RMPF_CLOCK);
+            s_state = (s_faults | s_latched) ? ZR_ST_FAULT : ZR_ST_IDLE;
+        } else {
+            if (s_state == ZR_ST_ABORT) break;           // Zenith: abort latched until SAFE
+            pyro_off(); s_cd = false;
+            const uint8_t setup_faults = ZL_RMPF_NO_CONT | ZL_RMPF_NO_KEY;   // normal while setting up the pad
+            s_state = (s_faults & ~setup_faults) ? ZR_ST_FAULT : ZR_ST_IDLE;
+        }
         break;
+
     case ZR_CMD_PREPARE:
-        if (s_state == ZR_ST_ABORT || (s_state == ZR_ST_FIRED && s_fire_end_ms)) break;
+        if (s_state == ZR_ST_FIRED && s_fire_end_ms) break;
+        if (s_state == ZR_ST_ABORT && !ariadna) break;
         pyro_off(); s_cd = false;
-        s_state = (s_faults == 0 && go) ? ZR_ST_READY : ZR_ST_FAULT;
+        if (s_faults == 0 && go) { s_latched &= (uint8_t)~ZL_RMPF_ROCKET; s_state = ZR_ST_READY; }
+        else { if (!go) s_latched |= ZL_RMPF_ROCKET; s_state = ZR_ST_FAULT; }
         break;
+
     case ZR_CMD_COUNTDOWN:
         if (s_state == ZR_ST_ABORT || s_state == ZR_ST_FIRED || s_state == ZR_ST_COMMITTED) break;
         if (t_rem <= 0 || t_rem > (int32_t)ZL_CD_MAX_MS) { enter_abort(ZL_RMPF_CLOCK); break; }
@@ -285,50 +321,217 @@ static void handle_rocket(const zl_rmp_cmd_t &c, uint32_t rx_ms)
         s_cd = true;
         s_state = ZR_ST_COUNTDOWN;
         break;
+
     case ZR_CMD_COMMIT:
-        if (s_state == ZR_ST_COMMITTED || s_state == ZR_ST_FIRED) break;   // repeated commits
+        if (s_state == ZR_ST_COMMITTED || s_state == ZR_ST_FIRED) break;    // repeated commits
         if (s_state != ZR_ST_COUNTDOWN) { enter_abort(ZL_RMPF_CLOCK); break; }
         if (!go) { enter_abort(ZL_RMPF_ROCKET); break; }
         if (s_faults) { enter_abort(s_faults); break; }
         if (t_rem < 5 || t_rem > (int32_t)ZL_RMP_COMMIT_MS + 50) { enter_abort(ZL_RMPF_CLOCK); break; }
         s_t0_ms = rx_ms + (uint32_t)t_rem;
+        s_cd = true;
         s_state = ZR_ST_COMMITTED;
-        Serial.printf("COMMITTED, T-%ld ms\n", (long)t_rem);
+        s_evt |= EVT_COMMIT;
         break;
+
     default: break;
     }
 }
 
-static void umb_poll(uint32_t now)
+// =====================================================================
+//  6. ARIADNA (Daidalos): I2C0 slave 0x2B
+// =====================================================================
+static void ariadna_refresh_tx(uint32_t now)
+{
+    ariadna_rampa_status_t st;
+    memset(&st, 0, sizeof st);
+    st.state = s_state;
+    st.last_seq = s_last_seq;
+    uint8_t f = (uint8_t)(s_flags & (ARIADNA_RMP_KEY_ARMED | ARIADNA_RMP_CONT1 | ARIADNA_RMP_CONT2 |
+                                     ARIADNA_RMP_CONT3 | ARIADNA_RMP_READY));
+    f |= ARIADNA_RMP_LORA_OFF;                               // radio is always off with an Ariadna on the pogo
+    if (s_state == ZR_ST_FIRED) f |= ARIADNA_RMP_PYRO_ARMED;
+    if (s_state == ZR_ST_COMMITTED) f |= ARIADNA_RMP_DETACHING;
+    st.flags = f;
+    st.fault_mask = (uint8_t)(s_faults | s_latched);         // identical bit meanings
+    st.vbat_mv = s_vbat_mv;
+    st.t_rem_ms = s_cd ? (int32_t)(s_t0_ms - now) : -1;
+    st.cont_mv[0] = s_cont_mv[0]; st.cont_mv[1] = s_cont_mv[1]; st.cont_mv[2] = s_cont_mv[2];
+    ariadna_rampa_status_seal(&st);
+    memcpy(s_i2c_tx, &st, sizeof st);
+}
+
+static void on_i2c_receive(int n)
+{
+    uint8_t buf[ARIADNA_RAMPA_CMD_SIZE];
+    size_t got = 0;
+    while (n-- > 0 && Wire.available()) {
+        const int c = Wire.read();
+        if (got < sizeof buf) buf[got++] = (uint8_t)c;
+    }
+    ariadna_rampa_cmd_t c;
+    if (got != sizeof buf || ariadna_rampa_cmd_decode(buf, got, &c) != ARIADNA_RAMPA_OK) return;
+    const uint32_t now = millis();
+    if (s_proto != P_ARIADNA) { s_proto = P_ARIADNA; s_evt |= EVT_LOCK_A; }
+    const uint8_t need = ARIADNA_RK_POST_OK | ARIADNA_RK_NAV_VALID | ARIADNA_RK_POS_OK |
+                         ARIADNA_RK_NAV_OK | ARIADNA_RK_NO_ABORT;
+    const bool go = (c.rocket_flags & need) == need;
+    // processed HERE so that the read which follows in the same transaction
+    // already carries the answer (Ariadna aborts if COMMITTED is not back in 25 ms)
+    rampa_cmd(P_ARIADNA, c.cmd, c.seq, c.t_rem_ms, go, c.pyro_ch, ARIADNA_FIRE_MS, now);
+    ariadna_refresh_tx(now);
+}
+
+static void on_i2c_request(void)
+{
+    Wire.write(s_i2c_tx, sizeof s_i2c_tx);
+    if (s_state == ZR_ST_COMMITTED) s_detach_req = true;     // float the pins before T-0 (Daidalos)
+}
+
+// =====================================================================
+//  7. ZENITH: UART0 115200
+// =====================================================================
+static void zenith_send_status(uint32_t now)
+{
+    zl_rmp_status_t st = {};
+    st.t_rem_ms = s_cd ? (int32_t)(s_t0_ms - now) : -1;
+    st.vbat_mv = s_vbat_mv;
+    st.umb_ma = s_umb_ma;
+    st.cont_mv[0] = s_cont_mv[0]; st.cont_mv[1] = s_cont_mv[1]; st.cont_mv[2] = s_cont_mv[2];
+    st.state = s_state;
+    st.flags = s_flags;
+    st.faults = (uint8_t)(s_faults | s_latched);
+    st.last_seq = s_last_seq;
+    st.fw = (uint8_t)(ZENITH_FW_VERSION & 0xFF);
+    uint8_t f[ZL_FRAME_MAX];
+    const uint16_t n = zl_encode(f, ZL_PKT_RMP_STATUS, &st, sizeof st);
+    if (Serial1.availableForWrite() >= (int)n) Serial1.write(f, n);
+}
+
+static void zenith_poll(void)
 {
     int budget = 256;
     while (Serial1.available() && budget-- > 0) {
         const uint8_t *pl; uint8_t n;
-        if (zl_rx_byte(&s_rx, (uint8_t)Serial1.read(), &pl, &n) == ZL_PKT_RMP_CMD) {
-            zl_rmp_cmd_t c;
-            if (zl_take(&c, sizeof c, pl, n)) {
-                handle_rocket(c, millis());
-                send_status(millis());
-            }
-        }
+        if (zl_rx_byte(&s_rx, (uint8_t)Serial1.read(), &pl, &n) != ZL_PKT_RMP_CMD) continue;
+        zl_rmp_cmd_t c;
+        if (!zl_take(&c, sizeof c, pl, n)) continue;
+        const uint32_t now = millis();
+        if (s_proto != P_ZENITH) { s_proto = P_ZENITH; s_evt |= EVT_LOCK_Z; }
+        // the frame travelled ~1.7 ms (20 B @ 115200) after the rocket stamped t_rem
+        const int32_t t_rem = c.t_rem_ms > 0 ? c.t_rem_ms - 2 : c.t_rem_ms;
+        noInterrupts();
+        rampa_cmd(P_ZENITH, c.cmd, c.seq, t_rem, (c.rocket_flags & ZL_RK_GO) != 0, c.pyro_ch, c.fire_ms, now);
+        interrupts();
+        zenith_send_status(now);
     }
-    s_rocket_present = s_last_cmd_ms && (uint32_t)(now - s_last_cmd_ms) < ROCKET_LINK_MS;
 }
 
 // =====================================================================
-//  7. STANDALONE LORA (no rocket on the pogo)
+//  8. UMBILICAL PORT: who owns GP0/GP1
+// =====================================================================
+static void port_close(void)
+{
+    if (s_port == PORT_UART) Serial1.end();
+    if (s_port == PORT_I2C) Wire.end();
+    pinMode(PIN_UMB_0, INPUT);
+    pinMode(PIN_UMB_1, INPUT);
+    s_port = PORT_OFF;
+}
+
+static void port_open(uint8_t p)
+{
+    if (s_port == p) return;
+    port_close();
+    if (p == PORT_UART) {
+        Serial1.setTX(PIN_UMB_0); Serial1.setRX(PIN_UMB_1);
+        Serial1.setFIFOSize(512);
+        Serial1.begin(ZL_UMB_BAUD);
+        zl_rx_init(&s_rx);
+    } else if (p == PORT_I2C) {
+        ariadna_refresh_tx(millis());
+        Wire.setSDA(PIN_UMB_0); Wire.setSCL(PIN_UMB_1);
+        Wire.begin((uint8_t)ARIADNA_RAMPA_I2C_ADDR);
+        Wire.onReceive(on_i2c_receive);
+        Wire.onRequest(on_i2c_request);
+    }
+    s_port = p;
+}
+
+static bool critical_state(void)
+{
+    return s_state == ZR_ST_COUNTDOWN || s_state == ZR_ST_COMMITTED ||
+           (s_state == ZR_ST_FIRED && (uint32_t)(millis() - s_fired_ms) < POST_FIRE_MS);
+}
+
+static void umbilical_service(uint32_t now)
+{
+    // ---- Ariadna hot-detach (after COMMITTED was read, or 20 ms before T-0) --
+    if (s_proto == P_ARIADNA && !s_detached) {
+        const bool late = s_state == ZR_ST_COMMITTED && (int32_t)(s_t0_ms - now) <= 20;
+        if (s_detach_req || late) {
+            port_close();
+            s_detached = true; s_detach_ms = now; s_detach_req = false;
+            s_evt |= EVT_DETACH;
+        }
+    }
+    if (s_detached) {
+        // re-attach once the launch is over (or did not happen): Ariadna re-enables
+        // its side 5 s after an unanswered commit
+        const bool done = s_state != ZR_ST_COMMITTED &&
+                          !(s_state == ZR_ST_FIRED && (uint32_t)(now - s_fired_ms) < POST_FIRE_MS);
+        if (done && (uint32_t)(now - s_detach_ms) > 2000u) {
+            s_detached = false;
+            s_last_cmd_ms = now;                          // give the rocket time to come back
+            port_open(PORT_I2C);
+        }
+        return;
+    }
+
+    // ---- locked: keep the port, drop the lock after a long silence ------------
+    if (s_proto != P_NONE) {
+        port_open(s_proto == P_ZENITH ? PORT_UART : PORT_I2C);
+        if ((uint32_t)(now - s_last_cmd_ms) > UNLOCK_MS && !critical_state()) {
+            s_proto = P_NONE;
+            s_evt |= EVT_UNLOCK;
+            s_scan_slot_ms = now;
+        }
+        return;
+    }
+
+    // ---- scanning --------------------------------------------------------------------
+    if ((uint32_t)(now - s_boot_ms) < BOOT_I2C_MS) { port_open(PORT_I2C); return; }
+    if ((uint32_t)(now - s_scan_slot_ms) >= SCAN_SLOT_MS) {
+        s_scan_slot_ms = now;
+        port_open(s_port == PORT_I2C ? PORT_UART : PORT_I2C);
+    } else if (s_port == PORT_OFF) {
+        port_open(PORT_I2C);
+    }
+}
+
+/** UMB_5V: only for a Zenith (or while looking for one); never for an Ariadna. */
+static bool rocket_supply_wanted(uint32_t now)
+{
+    if (!s_rocket_pwr || s_umb_trip) return false;
+    if (s_proto == P_ARIADNA) return false;
+    if (s_proto == P_NONE && (uint32_t)(now - s_boot_ms) < BOOT_I2C_MS) return false;
+    return true;
+}
+
+// =====================================================================
+//  9. STANDALONE LORA (no rocket on the pogo)
 // =====================================================================
 static void lora_power(bool on)
 {
     if (on == s_lora_on) return;
     if (on) {
-        exp_write((uint8_t)((s_exp_out | EXP_LORA_EN) & ~EXP_LORA_RST));   // power on, held in reset
+        exp_write((uint8_t)((s_exp_out | EXP_LORA_EN) & ~EXP_LORA_RST));
         delay(10);
-        exp_write((uint8_t)(s_exp_out | EXP_LORA_RST));                      // release reset
+        exp_write((uint8_t)(s_exp_out | EXP_LORA_RST));
         delay(10);
         SPI1.setSCK(PIN_LORA_SCK); SPI1.setTX(PIN_LORA_MOSI); SPI1.setRX(PIN_LORA_MISO);
         LoRa.setSPI(SPI1);
-        LoRa.setPins(PIN_LORA_CS, -1, -1);          // DIO0 is on the TCA9534: we poll instead
+        LoRa.setPins(PIN_LORA_CS, -1, -1);          // DIO0 is on the TCA9534: polled
         if (LoRa.begin(ZL_LORA_FREQ_HZ)) {
             LoRa.setSpreadingFactor(ZL_LORA_SF);
             LoRa.setSignalBandwidth(ZL_LORA_BW_HZ);
@@ -349,24 +552,25 @@ static void lora_power(bool on)
         SPI1.end();
         exp_write((uint8_t)(s_exp_out & ~(EXP_LORA_EN | EXP_LORA_RST)));
         s_lora_on = false;
-        Serial.println("LoRa OFF (rocket talks for us)");
+        Serial.println("LoRa OFF (rocket on the umbilical)");
     }
 }
 
 static uint8_t rampa_uplink(const zl_uplink_t &u)
 {
     if (u.token != zl_ul_token_for(u.cmd)) return ZL_RC_REJ_TOKEN;
+    uint8_t rc = ZL_RC_REJ_STATE;
+    noInterrupts();
     switch (u.cmd) {
-    case ZL_UL_NOP: return ZL_RC_OK;
-    case ZL_UL_ROCKET_PWR:
-        s_rocket_pwr = u.arg != 0;
-        exp_write(s_rocket_pwr ? (uint8_t)(s_exp_out | EXP_ROCKET_EN) : (uint8_t)(s_exp_out & ~EXP_ROCKET_EN));
-        return ZL_RC_OK;
-    case ZL_UL_ABORT: enter_abort(0); return ZL_RC_ABORTED;
-    case ZL_UL_SAFE:  pyro_off(); s_cd = false; s_latched = 0; s_state = ZR_ST_IDLE; return ZL_RC_OK;
-    case ZL_UL_LOCATE: s_locate = u.arg != 0; return ZL_RC_OK;
-    default: return ZL_RC_REJ_STATE;      // launching needs a rocket on the pogo
+    case ZL_UL_NOP: rc = ZL_RC_OK; break;
+    case ZL_UL_ROCKET_PWR: s_rocket_pwr = u.arg != 0; s_umb_trip = false; rc = ZL_RC_OK; break;
+    case ZL_UL_ABORT: enter_abort(0); rc = ZL_RC_ABORTED; break;
+    case ZL_UL_SAFE:  pyro_off(); s_cd = false; s_latched = 0; s_state = ZR_ST_IDLE; rc = ZL_RC_OK; break;
+    case ZL_UL_LOCATE: s_locate = u.arg != 0; rc = ZL_RC_OK; break;
+    default: break;                       // launching needs a rocket on the pogo
     }
+    interrupts();
+    return rc;
 }
 
 static void lora_service(uint32_t now)
@@ -374,8 +578,7 @@ static void lora_service(uint32_t now)
     static uint32_t next_beacon = 0;
     static bool rx = false, ack = false;
     if (!s_lora_on) return;
-    const bool in_win = (now % ZL_WIN_PERIOD_MS) < ZL_WIN_DUR_MS;
-    if (in_win) {
+    if ((now % ZL_WIN_PERIOD_MS) < ZL_WIN_DUR_MS) {
         if (!rx) { LoRa.receive(); rx = true; }
         const int sz = LoRa.parsePacket();
         if (sz > 0) {
@@ -397,13 +600,12 @@ static void lora_service(uint32_t now)
     }
     if (rx) { LoRa.idle(); rx = false; }
     int fin = 0;
-    const uint32_t to_win = zl_next_window_ms(now, -1, &fin);
-    if (to_win < ZL_WIN_TX_GUARD_MS) return;
+    if (zl_next_window_ms(now, -1, &fin) < ZL_WIN_TX_GUARD_MS) return;
     if (!ack && (int32_t)(now - next_beacon) < 0) return;
     zl_rampa_beacon_t b = {};
     b.state = s_state; b.flags = s_flags; b.t_ms = now;
     b.vbat_mv = s_vbat_mv; b.umb_ma = s_umb_ma;
-    memcpy(b.cont_mv, s_cont_mv, sizeof b.cont_mv);
+    b.cont_mv[0] = s_cont_mv[0]; b.cont_mv[1] = s_cont_mv[1]; b.cont_mv[2] = s_cont_mv[2];
     b.next_rx_in_ms = (uint16_t)zl_next_window_ms(millis(), -1, &fin);
     b.faults = (uint8_t)(s_faults | s_latched);
     b.last_ul_seq = s_ul_seq; b.last_ul_rc = s_ul_rc;
@@ -415,12 +617,12 @@ static void lora_service(uint32_t now)
 }
 
 // =====================================================================
-//  8. ANNUNCIATORS
+//  10. ANNUNCIATORS
 // =====================================================================
 static void outputs_update(uint32_t now)
 {
     uint8_t out = (uint8_t)(s_exp_out & (EXP_LORA_EN | EXP_LORA_RST));
-    if (s_rocket_pwr) out |= EXP_ROCKET_EN;
+    if (rocket_supply_wanted(now)) out |= EXP_ROCKET_EN;
     uint32_t c;
     const int32_t rem = (int32_t)(s_t0_ms - now);
     switch (s_state) {
@@ -433,7 +635,11 @@ static void outputs_update(uint32_t now)
     case ZR_ST_ABORT:     if ((now % 500u) < 250u) out |= EXP_FIRE_LED; c = (now % 250u) < 125u ? 0xFF00FF : 0; break;
     case ZR_ST_READY:     c = 0x00FF00; break;
     case ZR_ST_FAULT:     c = (now % 1000u) < 500u ? 0xFFFF00 : 0; break;
-    default:              c = s_rocket_present ? 0x0000FF : ((now % 2000u) < 1000u ? 0x0000FF : 0x000020); break;
+    default:
+        // blue = Zenith, cyan = Daidalos, blinking blue = looking for a rocket
+        c = s_proto == P_ZENITH ? 0x0000FF : s_proto == P_ARIADNA ? 0x00A0FF
+                                           : ((now % 2000u) < 1000u ? 0x0000FF : 0x000020);
+        break;
     }
     if (s_locate && (now % 2000u) < 500u) out |= EXP_BUZZER;
     exp_write(out);
@@ -441,13 +647,31 @@ static void outputs_update(uint32_t now)
     if (c != c_last) { s_rgb.setPixelColor(0, s_rgb.Color((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)); s_rgb.show(); c_last = c; }
 }
 
+static void print_events(void)
+{
+    noInterrupts();
+    const uint32_t e = s_evt;
+    s_evt = 0;
+    interrupts();
+    if (!e) return;
+    if (e & EVT_LOCK_Z)   Serial.println("ROCKET: Zenith (UART 115200)");
+    if (e & EVT_LOCK_A)   Serial.println("ROCKET: Daidalos / Ariadna V2 (I2C slave 0x2B)");
+    if (e & EVT_UNLOCK)   Serial.println("ROCKET: none (scanning I2C / UART)");
+    if (e & EVT_ABORT)    Serial.printf("ABORT faults 0x%02X\n", s_latched | s_faults);
+    if (e & EVT_COMMIT)   Serial.printf("COMMITTED, T-%ld ms\n", (long)(int32_t)(s_t0_ms - millis()));
+    if (e & EVT_DETACH)   Serial.println("Ariadna umbilical detached (GP0/GP1 Hi-Z)");
+    if (e & EVT_FIRE)     Serial.printf("FIRE channel %u for %u ms\n", s_pyro_ch, s_fire_ms);
+    if (e & EVT_UMB_TRIP) Serial.printf("UMB_5V overcurrent %u mA -> rocket supply OFF\n", s_umb_ma);
+}
+
 // =====================================================================
-//  9. SETUP / LOOP
+//  11. SETUP / LOOP
 // =====================================================================
 void setup()
 {
     pinMode(PIN_PYRO_ARM, OUTPUT); digitalWrite(PIN_PYRO_ARM, LOW);
     for (int i = 0; i < 3; i++) { pinMode(PIN_FIRE[i], OUTPUT); digitalWrite(PIN_FIRE[i], LOW); }
+    pinMode(PIN_UMB_0, INPUT); pinMode(PIN_UMB_1, INPUT);
 
     Serial.begin(115200);
     s_rgb.begin(); s_rgb.setBrightness(80); s_rgb.setPixelColor(0, s_rgb.Color(0, 0, 255)); s_rgb.show();
@@ -458,11 +682,11 @@ void setup()
     i2c_w16(ADDR_INA_BAT, 0x00, 0x4727); i2c_w16(ADDR_INA_BAT, 0x05, 1024);
     i2c_w16(ADDR_INA_UMB, 0x00, 0x4727); i2c_w16(ADDR_INA_UMB, 0x05, 1024);   // 1 mA/LSB on 5 mOhm
 
-    Serial1.setTX(PIN_UMB_TX); Serial1.setRX(PIN_UMB_RX);
-    Serial1.setFIFOSize(512);
-    Serial1.begin(ZL_UMB_BAUD);
-    zl_rx_init(&s_rx);
-
+    sensors_update(millis());
+    compute_flags();
+    s_boot_ms = millis();
+    s_scan_slot_ms = s_boot_ms;
+    port_open(PORT_I2C);                 // listen for an Ariadna first, rocket supply OFF
     watchdog_enable(1000, true);
 }
 
@@ -472,23 +696,25 @@ void loop()
     watchdog_update();
 
     sensors_update(now);
+    noInterrupts();
     compute_flags();
-    umb_poll(now);
+    interrupts();
 
-    // ---- local abort button always wins -------------------------------------------
+    if (s_port == PORT_UART) zenith_poll();
+    umbilical_service(now);
+
+    // ---- supervision (masked against the I2C slave interrupt) -------------------
+    noInterrupts();
     if (s_btn && (s_state == ZR_ST_READY || s_state == ZR_ST_COUNTDOWN || s_state == ZR_ST_COMMITTED))
         enter_abort(ZL_RMPF_BTN_ABORT);
-
-    // ---- countdown supervision -----------------------------------------------------------
     if (s_state == ZR_ST_COUNTDOWN) {
-        if ((uint32_t)(now - s_last_cmd_ms) > ZL_RMP_TIMEOUT_MS) enter_abort(ZL_RMPF_TIMEOUT);
-        else if (!(s_rocket_flags & ZL_RK_GO)) enter_abort(ZL_RMPF_ROCKET);
+        if ((uint32_t)(now - s_last_cmd_ms) > LINK_TIMEOUT_MS) enter_abort(ZL_RMPF_TIMEOUT);
+        else if (!s_rocket_go) enter_abort(ZL_RMPF_ROCKET);
         else if (s_faults) enter_abort(s_faults);
         else if ((int32_t)(s_t0_ms - now) < -100) enter_abort(ZL_RMPF_CLOCK);   // no COMMIT came
     }
     if (s_state == ZR_ST_COMMITTED && (int32_t)(now - s_t0_ms) >= 0) {
         // last-moment interlocks: key, button, battery, igniter
-        compute_flags();
         if (s_key && !s_btn && s_vbat_mv >= VBAT_MIN_MV && !(s_faults & ZL_RMPF_NO_CONT)) {
             digitalWrite(PIN_PYRO_ARM, HIGH);
             digitalWrite(PIN_FIRE[s_pyro_ch - 1], HIGH);
@@ -496,7 +722,7 @@ void loop()
             s_fire_end_ms = now + s_fire_ms;
             s_cd = false;
             s_state = ZR_ST_FIRED;
-            Serial.printf("FIRE channel %u for %u ms\n", s_pyro_ch, s_fire_ms);
+            s_evt |= EVT_FIRE;
         } else {
             enter_abort(s_faults);
         }
@@ -505,19 +731,20 @@ void loop()
         if (s_fire_end_ms && (int32_t)(now - s_fire_end_ms) >= 0) { pyro_off(); s_fire_end_ms = 0; }
         if (!s_fire_end_ms && (uint32_t)(now - s_fired_ms) > POST_FIRE_MS) s_state = ZR_ST_IDLE;
     }
-    if (s_state != ZR_ST_FIRED && s_state != ZR_ST_COMMITTED) {
-        // nothing may stay energised outside a firing pulse
-        if (digitalRead(PIN_PYRO_ARM)) pyro_off();
-    }
+    if (s_state != ZR_ST_FIRED && s_state != ZR_ST_COMMITTED && digitalRead(PIN_PYRO_ARM)) pyro_off();
+    if (s_port == PORT_I2C) ariadna_refresh_tx(now);
+    interrupts();
 
-    // ---- radio ownership --------------------------------------------------------------------
+    // ---- rocket supply protection ------------------------------------------------
+    if ((s_exp_out & EXP_ROCKET_EN) && s_umb_ma > UMB_OVERCURRENT) { s_umb_trip = true; s_evt |= EVT_UMB_TRIP; }
+
+    // ---- radio ownership ----------------------------------------------------------
     static uint32_t no_rocket_since = 0;
-    if (s_rocket_present) { no_rocket_since = 0; if (s_lora_on) lora_power(false); }
+    const bool rocket = s_proto != P_NONE || s_detached;
+    if (rocket) { no_rocket_since = 0; if (s_lora_on) lora_power(false); }
     else {
         if (!no_rocket_since) no_rocket_since = now ? now : 1;
-        // never switch the radio on around a launch: the rocket just left
-        // After a launch the rocket owns the 433 MHz channel (its telemetry,
-        // its RX windows) for the whole flight and recovery: stay silent.
+        // after a launch the rocket owns the 433 MHz channel: stay silent
         const bool quiet = s_state != ZR_ST_COMMITTED && s_state != ZR_ST_COUNTDOWN &&
                            !(s_fired_ms && (uint32_t)(now - s_fired_ms) < RADIO_QUIET_AFTER_FIRE_MS);
         if (!s_lora_on && quiet && (uint32_t)(now - no_rocket_since) > 2000u) lora_power(true);
@@ -525,13 +752,14 @@ void loop()
     lora_service(now);
 
     outputs_update(now);
+    print_events();
 
-    // ---- console status ----------------------------------------------------------------------
     static uint32_t t_dbg = 0;
     if ((int32_t)(now - t_dbg) >= 0) {
         t_dbg = now + 1000;
-        Serial.printf("RAMPA st %u flags 0x%02X faults 0x%02X vbat %u umb %u mA cont %u/%u/%u key %d btn %d rocket %d lora %d\n",
-                      s_state, s_flags, s_faults | s_latched, s_vbat_mv, s_umb_ma, s_cont_mv[0], s_cont_mv[1], s_cont_mv[2],
-                      s_key, s_btn, s_rocket_present, s_lora_on);
+        static const char *PN[3] = { "scan", "ZENITH", "ARIADNA" };
+        Serial.printf("RAMPA %s port %u st %u flags 0x%02X faults 0x%02X vbat %u umb %u mA cont %u/%u/%u key %d btn %d lora %d\n",
+                      PN[s_proto], s_port, s_state, s_flags, s_faults | s_latched, s_vbat_mv, s_umb_ma,
+                      s_cont_mv[0], s_cont_mv[1], s_cont_mv[2], s_key, s_btn, s_lora_on);
     }
 }
