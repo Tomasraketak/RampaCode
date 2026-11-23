@@ -182,7 +182,25 @@ def stats(r: Record, thr_min: float | None = None) -> dict:
     ip = max(idx, key=lambda i: r.f[i])
     out["peak"], out["t_peak"] = r.f[ip], r.t[ip]
     thr = max(0.05 * out["peak"], thr_min if thr_min is not None else r.cfg.get("ign_thr_n", 2.0))
-    above = [i for i in idx if r.f[i] > thr]
+    # same rule as the rampa: start / end = first / last point of a run that stays above the
+    # threshold for 30 ms (single spikes ignored), everything in between counts
+    run = max(1, int(round(0.030 * (r.sps or 2000))))
+    a = b = None
+    k = 0
+    for i in idx:
+        k = k + 1 if r.f[i] > thr else 0
+        if k == run:
+            a = i - run + 1
+            break
+    k = 0
+    for i in reversed(idx):
+        if a is None or i < a:
+            break
+        k = k + 1 if r.f[i] > thr else 0
+        if k == run:
+            b = i + run - 1
+            break
+    above = [a, b] if a is not None and b is not None else []
     pv = [x for x in r.p if x == x]
     out["pmax"] = max(pv) if pv else float("nan")
     for k, arr in (("t1max", r.t1), ("t2max", r.t2)):

@@ -27,6 +27,12 @@
 //
 //  Commands are acknowledged in the next TLM (ack_seq + ack_rc); a repeated
 //  seq is acknowledged again but never executed twice, so retries are safe.
+//
+//  After a test the station pulls the burn itself (SL_C_BURN): the rampa
+//  detects where the thrust starts and ends, crops it, sends it at 50 Hz in
+//  188-byte blocks back to back (40 ms listening gap between them, a TLM
+//  every 8 blocks), and the station asks again only for missing blocks.
+//  A 10 s burn = ~14 blocks = ~3 s on the air.
 // =====================================================================
 #ifndef STAND_LINK_H
 #define STAND_LINK_H
@@ -54,6 +60,7 @@
 #define SL_TLM_MAGIC           0xD1u
 #define SL_RES_MAGIC           0xD2u
 #define SL_CRV_MAGIC           0xD3u
+#define SL_BURN_MAGIC          0xD4u
 #define SL_CMD_MAGIC           0xD9u
 
 // ------------------------------------------------------------------ timing
@@ -72,6 +79,12 @@
 #define SL_SUBS                10       // force sub-samples per TLM
 #define SL_CRV_PTS             16       // curve points per CURVE packet
 #define SL_CURVE_HZ            100
+#define SL_BURN_PTS            40       // points per BURN packet
+#define SL_BURN_GAP_MS         40u      // rampa listens this long between BURN packets of a burst
+#define SL_BURN_PRE_MS         250      // the burn crop starts this long before the burn start ...
+#define SL_BURN_POST_MS        500      // ... and ends this long after the burn end
+#define SL_BURN_RUN_MS         30       // thrust must stay above the threshold this long (start / end)
+#define SL_T_NOBURN            ((int32_t)0x80000000)
 
 // ------------------------------------------------------------------ states
 typedef enum {
@@ -130,6 +143,8 @@ typedef enum {
     SL_C_RECTIME  = 11,   // arg = s recorded after T-0 (SL_REC_MIN_S..MAX), saved
     SL_C_CAL      = 12,   // arg = known force on the load cell, mN (SAFE)     (token)
     SL_C_PZERO    = 13,   // pressure transducer zero = now (vented, SAFE)
+    SL_C_BURN     = 14,   // the cropped burn: arg = first block, arg2 = blocks (0 = all the rest),
+                          // sent back to back (selective repeat: ask again only for the missing ones)
     SL_C_COUNT
 } sl_cmd_t;
 
@@ -238,6 +253,33 @@ typedef struct {
     uint16_t crc;            // 72
 } sl_curve_t;
 
+/**
+ * rampa -> station on SL_C_BURN, 188 B: one block of the burn only, cropped by
+ * the rampa (burn start - SL_BURN_PRE_MS .. burn end + SL_BURN_POST_MS),
+ * 50 Hz (20 Hz when the crop is longer than 30 s), each point the mean of the
+ * 100 Hz curve over its interval. Point i of block k is at
+ * t_first_ms + (k * SL_BURN_PTS + i) * 1000 / rate_hz ms from T-0.
+ */
+typedef struct {
+    uint8_t  magic;          //  0 SL_BURN_MAGIC
+    uint8_t  ver;            //  1
+    uint16_t test_no;        //  2
+    uint8_t  idx;            //  4 block 0 .. n_blocks-1
+    uint8_t  n_blocks;       //  5
+    uint8_t  n;              //  6 valid points in this block
+    int8_t   fexp;           //  7 force = f * 0.1 * 2^fexp (same for every block)
+    uint8_t  rate_hz;        //  8 50 or 20
+    uint8_t  flags;          //  9 SL_RF_* of the test
+    int32_t  t_first_ms;     // 10 first point of the crop, from T-0 (cold: from the record start)
+    int32_t  burn_a_ms;      // 14 detected burn start, from T-0 (SL_T_NOBURN: no burn)
+    int32_t  burn_b_ms;      // 18 detected burn end
+    int16_t  t1_dc;          // 22 temperatures at the first point of this block (SL_T_NONE)
+    int16_t  t2_dc;          // 24
+    int16_t  f[SL_BURN_PTS]; // 26
+    int16_t  p[SL_BURN_PTS]; // 106 pressure, 0.1 psi
+    uint16_t crc;            // 186
+} sl_burn_t;
+
 /** station -> rampa, 14 B. */
 typedef struct {
     uint8_t  magic;          //  0 SL_CMD_MAGIC
@@ -255,6 +297,7 @@ SL_STATIC_ASSERT(sizeof(sl_tlm_t) == 56, "sl_tlm_t layout");
 SL_STATIC_ASSERT(sizeof(sl_res_t) == 52, "sl_res_t layout");
 SL_STATIC_ASSERT(sizeof(sl_curve_t) == 74, "sl_curve_t layout");
 SL_STATIC_ASSERT(sizeof(sl_cmd_pkt_t) == 14, "sl_cmd_pkt_t layout");
+SL_STATIC_ASSERT(sizeof(sl_burn_t) == 188, "sl_burn_t layout");
 
 /** CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF). */
 static inline uint16_t sl_crc16(const uint8_t *p, size_t n)

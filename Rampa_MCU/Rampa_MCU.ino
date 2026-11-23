@@ -642,6 +642,9 @@ static uint16_t s_sl_fire_ms = 1000;
 static uint32_t s_sl_cold_s = 0;
 static bool     s_sl_buzzer = false, s_sl_hang = false, s_sl_fired = false;
 static int32_t  s_sl_curve_off = -1;             // CURVE answer due
+static int16_t  s_bu_next = -1, s_bu_last = -1;  // BURN burst: next block to send, last one
+static uint32_t s_bu_at = 0;                     // not before (listening gap)
+static uint8_t  s_bu_sent = 0;                   // blocks since the last TLM
 static uint8_t  s_sl_res_tx = 0;                 // RES copies still to send
 static uint32_t s_c1_alive = 0, s_c1_alive_ms = 0;
 static bool     s_c1_ok = true;
@@ -801,6 +804,15 @@ static uint8_t stand_cmd(uint8_t cmd, int32_t arg, uint16_t arg2, uint16_t token
 
     case SL_C_BUZZER:
         s_sl_buzzer = arg != 0;
+        return SL_RC_OK;
+
+    case SL_C_BURN:
+        if (!ts_res_ready || !ts_burn.valid || ts_rec != TR_IDLE || !(idle || s_sl == SL_ST_ABORT)) return SL_RC_REJ_STATE;
+        if (arg < 0 || arg >= ts_burn.nblocks) return SL_RC_REJ_ARG;
+        s_bu_next = (int16_t)arg;
+        s_bu_last = (int16_t)((arg2 == 0 || arg + arg2 > ts_burn.nblocks) ? ts_burn.nblocks - 1 : arg + arg2 - 1);
+        s_bu_at = now + 10u;
+        s_bu_sent = 0;
         return SL_RC_OK;
 
     case SL_C_RECTIME: {
@@ -1015,6 +1027,32 @@ static void build_res(sl_res_t &r)
     sl_seal(&r, sizeof r, SL_RES_MAGIC);
 }
 
+/** Block k of the cropped burn (each point = mean of `div` 100 Hz curve points). */
+static void build_burn(sl_burn_t &p, int k)
+{
+    const ts_burn_t &B = ts_burn;
+    memset(&p, 0, sizeof p);
+    p.test_no = ts_test_no;
+    p.idx = (uint8_t)k; p.n_blocks = B.nblocks; p.fexp = B.fexp; p.rate_hz = B.rate_hz; p.flags = ts_res.flags;
+    const int32_t base = ts_ct0 >= 0 ? ts_ct0 : 0;              // time zero of the curve
+    p.t_first_ms = (B.crop_a - base) * (1000 / SL_CURVE_HZ);
+    p.burn_a_ms = B.burn ? (B.a - base) * (1000 / SL_CURVE_HZ) : SL_T_NOBURN;
+    p.burn_b_ms = B.burn ? (B.b + 1 - base) * (1000 / SL_CURVE_HZ) : SL_T_NOBURN;   // end of the last point
+    const int first = k * SL_BURN_PTS;
+    const int i0 = B.crop_a + first * B.div;
+    p.t1_dc = i0 < (int)ts_cn ? ts_ct1[i0] : SL_T_NONE;
+    p.t2_dc = i0 < (int)ts_cn ? ts_ct2[i0] : SL_T_NONE;
+    uint8_t n = 0;
+    for (int j = first; j < B.npts && n < SL_BURN_PTS; j++, n++) {
+        double f = 0, pr = 0; int m = 0;
+        for (int i = B.crop_a + j * B.div; i < B.crop_a + (j + 1) * B.div && i < (int)ts_cn; i++, m++) { f += ts_cf[i]; pr += ts_cp[i]; }
+        p.f[n] = m ? sl_fpack((float)(f / m), B.fexp) : 0;
+        p.p[n] = m ? (int16_t)(pr / m + (pr >= 0 ? 0.5 : -0.5)) : 0;
+    }
+    p.n = n;
+    sl_seal(&p, sizeof p, SL_BURN_MAGIC);
+}
+
 static bool build_curve(sl_curve_t &c, int32_t off)
 {
     memset(&c, 0, sizeof c);
@@ -1178,6 +1216,7 @@ static void lora_receive(uint32_t now)
         if (!s_stand) return;
         s_sl_rx_ms = now;
         if (c.seq != s_sl_seq) {
+            if (c.cmd != SL_C_PING && c.cmd != SL_C_BURN) s_bu_next = -1;   // anything else stops a burst
             s_sl_rc = stand_cmd(c.cmd, c.arg, c.arg2, c.token, true, now);
             s_sl_seq = c.seq;
             if (c.cmd != SL_C_PING) Serial.printf("# STAND cmd %u arg %ld -> rc %u\n", c.cmd, (long)c.arg, s_sl_rc);
@@ -1210,6 +1249,22 @@ static void lora_service(uint32_t now)
     if (s_stand) {
         // keep the air quiet in the last 150 ms before T-0 (the station may be sending ABORT)
         if (s_sl == SL_ST_COUNTDOWN && (int32_t)(s_sl_t0 - now) < 150 && (int32_t)(s_sl_t0 - now) > -20) return;
+        // BURN burst: blocks back to back, a listening gap after each, a TLM every 8 blocks
+        if (s_bu_next >= 0 && (s_sl == SL_ST_SAFE || s_sl == SL_ST_ABORT) && ts_burn.valid) {
+            if ((int32_t)(now - s_bu_at) < 0) return;
+            if (s_bu_sent >= 8) {
+                s_bu_sent = 0;
+                sl_tlm_t t; build_tlm(t, now); lora_send(&t, sizeof t);
+            } else {
+                sl_burn_t p; build_burn(p, s_bu_next); lora_send(&p, sizeof p);
+                s_bu_sent++;
+                if (++s_bu_next > s_bu_last) s_bu_next = -1;
+            }
+            s_bu_at = s_lora_free_at + SL_BURN_GAP_MS;
+            s_sl_next_tlm = s_bu_at + 300u;          // the regular TLM waits for the burst
+            return;
+        }
+        s_bu_next = -1;
         if (s_sl_reply && (int32_t)(now - s_sl_reply_at) >= 0) {
             s_sl_reply = false;
             if (s_sl_curve_off >= 0) { sl_curve_t c; build_curve(c, s_sl_curve_off); s_sl_curve_off = -1; lora_send(&c, sizeof c); return; }

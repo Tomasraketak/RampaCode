@@ -228,6 +228,21 @@ static sl_res_t          ts_res;
 static float             ts_cf[TS_CURVE_MAX];      // force
 static int16_t           ts_cp[TS_CURVE_MAX];      // pressure 0.1 psi
 static float             ts_ci[TS_CURVE_MAX];      // cumulative impulse at the end of the point
+static int16_t           ts_ct1[TS_CURVE_MAX];     // temperatures 0.1 degC (SL_T_NONE)
+static int16_t           ts_ct2[TS_CURVE_MAX];
+// the burn found in the curve and the crop sent over LoRa (SL_C_BURN)
+typedef struct {
+    bool     valid;          // crop ready (results of the last record)
+    bool     burn;           // a burn was found
+    int32_t  a, b;           // burn start / end, curve index
+    int32_t  crop_a;         // first curve index of the crop
+    uint16_t npts;           // points in the crop at rate_hz
+    uint8_t  div;            // curve points per crop point (2 = 50 Hz, 5 = 20 Hz)
+    uint8_t  rate_hz;
+    uint8_t  nblocks;
+    int8_t   fexp;
+} ts_burn_t;
+static ts_burn_t         ts_burn;
 static volatile uint16_t ts_cn = 0;
 static volatile int16_t  ts_ct0 = -1;
 
@@ -465,6 +480,7 @@ static float    ts_st_last_f = 0;
 static bool     ts_st_fired = false;
 // curve accumulation (10 ms buckets)
 static double   ts_cb_f = 0, ts_cb_p = 0; static uint16_t ts_cb_n = 0;
+static uint32_t ts_cb_end = 10000;                       // the 10 ms bucket ends at this t_us (record time)
 
 static void ts_rec_begin(uint32_t blocks, bool cold)
 {
@@ -477,6 +493,7 @@ static void ts_rec_begin(uint32_t blocks, bool cold)
     ts_erase_all = false;
     ts_progress = 0;
     ts_res_ready = false;
+    ts_burn.valid = false;
     ts_rec = TR_ERASING;
 }
 
@@ -501,7 +518,7 @@ static void ts_rec_start_frames(void)
     ts_rec_t0_frame = -1;
     ts_st_peak = 0; ts_st_tpeak = 0; ts_st_pmax = 0; ts_st_imp = 0; ts_st_last_us = 0; ts_st_last_f = 0;
     ts_st_t1max = NAN; ts_st_t2max = NAN; ts_st_fired = false;
-    ts_cn = 0; ts_ct0 = -1; ts_cb_f = ts_cb_p = 0; ts_cb_n = 0;
+    ts_cn = 0; ts_ct0 = -1; ts_cb_f = ts_cb_p = 0; ts_cb_n = 0; ts_cb_end = 10000;
     ts_t0_req = false;
     ts_rec = TR_RECORDING;
 }
@@ -529,11 +546,14 @@ static void ts_push_frame(const ts_frame_t &fr)
     if (ts_pg_fill >= TS_PAGE) { ts_pg_fill = 0; ts_pg_w = (uint16_t)(ts_pg_w + 1); }
 }
 
-static void ts_curve_point(float f, float p_psi)
+static float ts_therm_c(const ts_cfg_t &c, float ratio);
+static void ts_curve_point(float f, float p_psi, float t1, float t2)
 {
     if (ts_cn >= TS_CURVE_MAX) return;
     ts_cf[ts_cn] = f;
     ts_cp[ts_cn] = sl_sat16(p_psi * 10.0f);
+    ts_ct1[ts_cn] = sl_sat16(t1 * 10.0f);
+    ts_ct2[ts_cn] = sl_sat16(t2 * 10.0f);
     ts_ci[ts_cn] = (float)ts_st_imp;
     ts_cn = (uint16_t)(ts_cn + 1);
 }
@@ -545,6 +565,8 @@ static void ts_curve_t0(void)
         memmove(ts_cf, ts_cf + k, TS_CURVE_PRE * sizeof ts_cf[0]);
         memmove(ts_cp, ts_cp + k, TS_CURVE_PRE * sizeof ts_cp[0]);
         memmove(ts_ci, ts_ci + k, TS_CURVE_PRE * sizeof ts_ci[0]);
+        memmove(ts_ct1, ts_ct1 + k, TS_CURVE_PRE * sizeof ts_ct1[0]);
+        memmove(ts_ct2, ts_ct2 + k, TS_CURVE_PRE * sizeof ts_ct2[0]);
         ts_cn = TS_CURVE_PRE;
     }
     ts_ct0 = (int16_t)ts_cn;
@@ -569,11 +591,55 @@ static void ts_results(void)
     r.curve_fexp = sl_fexp_for(fmax);
     const int s0 = ts_ct0 >= 0 ? ts_ct0 : 0;
     r.t_peak_s = ts_st_tpeak;
+    // ---- burn detection on the 100 Hz curve (thrust means of 10 ms):
+    //   threshold = max(5 % of the peak, ign_thr_n);
+    //   START = first point (from T-0) of the first run that stays above it for SL_BURN_RUN_MS,
+    //   END   = last point of the last such run.
+    // A single spike (igniter pop, a knock on the stand, noise) is shorter than
+    // the run and is ignored; a chuff or a second burn phase longer than it is
+    // part of the burn. Everything between START and END counts (also dips).
     float thr = 0.05f * ts_st_peak;
     if (thr < ts_cfg.ign_thr_n) thr = ts_cfg.ign_thr_n;
-    int a = -1, b = -1;
-    for (int i = s0; i < (int)ts_cn; i++) if (ts_cf[i] > thr) { if (a < 0) a = i; b = i; }
-    if (a >= 0 && ts_st_peak > ts_cfg.ign_thr_n) {
+    const int run = SL_BURN_RUN_MS * SL_CURVE_HZ / 1000;
+    int a = -1, b = -1, k = 0;
+    for (int i = s0; i < (int)ts_cn; i++) {
+        k = ts_cf[i] > thr ? k + 1 : 0;
+        if (k == run) { a = i - run + 1; break; }
+    }
+    k = 0;
+    for (int i = (int)ts_cn - 1; a >= 0 && i >= a; i--) {
+        k = ts_cf[i] > thr ? k + 1 : 0;
+        if (k == run) { b = i + run - 1; break; }
+    }
+    // ---- the crop sent over LoRa
+    ts_burn_t &B = ts_burn;
+    memset(&B, 0, sizeof B);
+    if (a >= 0 && b >= a) {
+        B.burn = true; B.a = a; B.b = b;
+        B.crop_a = a - SL_BURN_PRE_MS * SL_CURVE_HZ / 1000;
+        b += SL_BURN_POST_MS * SL_CURVE_HZ / 1000;
+    } else if (ts_ct0 >= 0) {                          // fired, nothing burned: show T-0 - 0.5 .. + 3 s
+        B.crop_a = ts_ct0 - 50; b = ts_ct0 + 300;
+    } else {                                           // cold record without thrust: all of it
+        B.crop_a = 0; b = (int)ts_cn - 1;
+    }
+    if (B.crop_a < 0) B.crop_a = 0;
+    if (b > (int)ts_cn - 1) b = (int)ts_cn - 1;
+    if (ts_cn && b >= B.crop_a) {
+        const int n100 = b - B.crop_a + 1;
+        B.div = n100 <= 30 * SL_CURVE_HZ ? 2 : 5;
+        B.rate_hz = (uint8_t)(SL_CURVE_HZ / B.div);
+        B.npts = (uint16_t)((n100 + B.div - 1) / B.div);
+        int nb = (B.npts + SL_BURN_PTS - 1) / SL_BURN_PTS;
+        if (nb > 255) { nb = 255; B.npts = 255 * SL_BURN_PTS; }
+        B.nblocks = (uint8_t)nb;
+        float fm = 0;
+        for (int i = B.crop_a; i <= b; i++) if (fabsf(ts_cf[i]) > fm) fm = fabsf(ts_cf[i]);
+        B.fexp = sl_fexp_for(fm);
+        B.valid = true;
+    }
+    if (a >= 0 && b >= a && ts_st_peak > ts_cfg.ign_thr_n) {
+        b = ts_burn.b;
         r.flags |= SL_RF_IGNITION;
         r.burn_s = (b - a + 1) / (float)SL_CURVE_HZ;
         r.impulse_ns = ts_ci[b] - (a > 0 ? ts_ci[a - 1] : 0.0f);
@@ -665,6 +731,12 @@ static void ts_sample(int32_t lc, bool lc_valid)
         if (ts_t0_req && ts_rec_t0_frame < 0) {
             ts_rec_t0_frame = (int32_t)ts_rec_frames;
             ts_st_fired = true;
+            if (ts_cb_n) {                                     // close the bucket before T-0 ...
+                ts_curve_point((float)(ts_cb_f / ts_cb_n), (float)(ts_cb_p / ts_cb_n),
+                               ts_therm_c(c, ts_th[0] / 65535.0f), ts_therm_c(c, ts_th[1] / 65535.0f));
+                ts_cb_f = ts_cb_p = 0; ts_cb_n = 0;
+            }
+            ts_cb_end = fr.t_us + 10000u;                       // ... curve point ts_ct0 starts exactly at T-0
             ts_curve_t0();
         }
         ts_push_frame(fr);
@@ -677,11 +749,16 @@ static void ts_sample(int32_t lc, bool lc_valid)
             ts_st_tpeak = ts_rec_cold ? fr.t_us * 1e-6f : (ts_cn > (uint16_t)ts_ct0 ? (ts_cn - ts_ct0) / (float)SL_CURVE_HZ : 0.0f);
         }
         if (psi == psi && psi > ts_st_pmax) ts_st_pmax = psi;
-        ts_cb_f += f; ts_cb_p += (psi == psi ? psi : 0.0); ts_cb_n++;
-        if (ts_cb_n >= (ts_cfg.rate_2k ? 20u : 10u)) {
-            ts_curve_point((float)(ts_cb_f / ts_cb_n), (float)(ts_cb_p / ts_cb_n));
+        // 100 Hz curve: one point per 10 ms of record time (by the time stamps, so the
+        // thermistor gaps do not stretch it); a gap longer than 10 ms repeats the last mean
+        while (fr.t_us >= ts_cb_end) {
+            static float lf = 0, lp = 0;
+            if (ts_cb_n) { lf = (float)(ts_cb_f / ts_cb_n); lp = (float)(ts_cb_p / ts_cb_n); }
+            ts_curve_point(lf, lp, ts_therm_c(c, ts_th[0] / 65535.0f), ts_therm_c(c, ts_th[1] / 65535.0f));
             ts_cb_f = ts_cb_p = 0; ts_cb_n = 0;
+            ts_cb_end += 10000u;
         }
+        ts_cb_f += f; ts_cb_p += (psi == psi ? psi : 0.0); ts_cb_n++;
         const uint32_t cap = (ts_rec_blocks * TS_BLOCK - TS_FRAMES_OFF) / TS_FRAME_SIZE;
         ts_progress = (uint8_t)(ts_rec_frames * 100ull / (cap ? cap : 1));
         if (ts_rec_frames >= cap) ts_rec_finish(false);

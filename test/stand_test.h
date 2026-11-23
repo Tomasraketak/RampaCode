@@ -160,6 +160,53 @@ static void test_stand()
     CHECK(last_pkt(c, SL_CRV_MAGIC) && c.offset == 120 && c.n == SL_CRV_PTS, "CURVE 120 -> 16 points");
     CHECK(fabs(sl_funpack(c.f[10], c.fexp) - 100.0) < 1.0 && fabs(c.p[10] / 10.0 - 300) < 3, "curve point = 100 N / 300 psi (T0 at %d)", r.t0_idx);
 
+    printf("== cropped burn over LoRa (BURN, selective repeat)\n");
+    {
+        LoRa.tx.clear();
+        gs_send(SL_C_BURN, 0, 0);
+        run_ms(2500);
+        std::vector<sl_burn_t> got;
+        uint32_t t_first = 0, t_last = 0;
+        for (auto &k : LoRa.tx) {
+            sl_burn_t b;
+            if (sl_check(k.b.data(), k.b.size(), sizeof b, SL_BURN_MAGIC)) {
+                memcpy(&b, k.b.data(), sizeof b); got.push_back(b);
+                if (!t_first) t_first = k.t_ms;
+                t_last = k.t_ms;
+            }
+        }
+        CHECK(!got.empty() && got[0].n_blocks == got.size(), "burst: %zu of %u blocks", got.size(), got.empty() ? 0 : got[0].n_blocks);
+        if (!got.empty()) {
+            const sl_burn_t &b0 = got[0];
+            CHECK(b0.rate_hz == 50 && abs(b0.burn_a_ms - 150) <= 10 && abs(b0.burn_b_ms - 2150) <= 20,
+                  "burn detected %ld .. %ld ms after T-0 (motor 150 .. 2150), 50 Hz", (long)b0.burn_a_ms, (long)b0.burn_b_ms);
+            CHECK(abs(b0.t_first_ms - (b0.burn_a_ms - SL_BURN_PRE_MS)) <= 10, "crop starts %ld ms (burn start - 250 ms)", (long)b0.t_first_ms);
+            int total = 0; double fmid = 0, pmid = 0, fpre = 99;
+            for (auto &b : got) for (int i = 0; i < b.n; i++) {
+                const int j = b.idx * SL_BURN_PTS + i;
+                const double tm = b0.t_first_ms + j * 1000.0 / b0.rate_hz;
+                if (fabs(tm - 1000) < 10) { fmid = sl_funpack(b.f[i], b.fexp); pmid = b.p[i] / 10.0; }
+                if (fabs(tm - 0) < 10) fpre = sl_funpack(b.f[i], b.fexp);
+                total++;
+            }
+            const double t_end = b0.t_first_ms + total * 20.0;
+            CHECK(fabs(t_end - (b0.burn_b_ms + SL_BURN_POST_MS)) <= 30, "crop ends %.0f ms (burn end + 500 ms), %d points", t_end, total);
+            CHECK(fabs(fmid - 100) < 1.0 && fabs(pmid - 300) < 3 && fabs(fpre) < 1.0, "values: T+1 s %.1f N %.0f psi, T-0 %.1f N", fmid, pmid, fpre);
+            CHECK(t_last - t_first < 1500, "whole burst on the air in %u ms", t_last - t_first);
+            CHECK(got.back().t1_dc > 300, "block temperatures (T1 %.1f degC)", got.back().t1_dc / 10.0);
+            // a block lost: ask for it alone
+            LoRa.tx.clear();
+            gs_send(SL_C_BURN, 2, 1);
+            run_ms(600);
+            int n2 = 0, other = 0;
+            for (auto &k : LoRa.tx) { sl_burn_t b; if (sl_check(k.b.data(), k.b.size(), sizeof b, SL_BURN_MAGIC)) { memcpy(&b, k.b.data(), sizeof b); if (b.idx == 2) n2++; else other++; } }
+            CHECK(n2 == 1 && other == 0, "BURN 2 1 -> only block 2 again");
+            sl_tlm_t t2{};
+            CHECK(last_tlm(t2) && t2.ack_seq == gs_seq && t2.ack_rc == SL_RC_OK, "BURN acknowledged in the telemetry");
+            CHECK(gs_cmd(SL_C_BURN, 99, 1) == SL_RC_REJ_ARG, "BURN past the last block -> rejected");
+        }
+    }
+
     printf("== flash record via USB\n");
     o = usb("LIST", 50);
     char want[32]; snprintf(want, sizeof want, "$REC,%u,", ts_test_no);

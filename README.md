@@ -137,8 +137,27 @@ nekalibrovaného signálu).
 5. **② ZAPÁLIT** (napsat `ZAPAL`) – rampa odpočítává sama (3–60 s), v T-3 s začne záznam, v T-0
    pustí proud do rozbušky na nastavený puls a zaznamenává do T-0 + *záznam po T-0* (výchozí 20 s).
 6. Po testu rampa pošle výsledky (špička, impulz, doba hoření, průměrný tah, třída motoru, zpoždění zážehu,
-   max. tlak a teploty) a stanice stáhne 100 Hz křivku → `Dokumenty\GroundStation\stand\test_NNN_….csv`.
-   Plný záznam (2000 S/s) stáhneš diagnostikou rampy přes USB → `Dokumenty\Rampa`.
+   max. tlak a teploty) a stanice sama stáhne **ořízlý zážeh** (tah, tlak a teploty, 50 Hz) →
+   `Dokumenty\GroundStation\stand\test_NNN_….csv`. Plný záznam (2000 S/s) stáhneš diagnostikou rampy přes USB
+   → `Dokumenty\Rampa`.
+
+### Zážeh přes LoRa (oříznutý, 50 Hz)
+
+**Jak rampa pozná začátek a konec hoření** (z 100 Hz průběhu = průměry tahu po 10 ms, od T-0):
+
+* práh = **5 % špičkového tahu**, nejméně `ign_thr_n` (výchozí 2 N);
+* **začátek** = první okamžik, od kterého tah zůstane nad prahem **aspoň 30 ms** v kuse;
+* **konec** = poslední okamžik úseku nad prahem dlouhého aspoň 30 ms (hledá se od konce záznamu);
+* krátké špičky pod 30 ms (rána rozbušky, ťuknutí do stojanu, šum) se nepočítají; propady a „chuffing“ mezi
+  začátkem a koncem patří k hoření. Doba hoření, impulz (z plné frekvence 2000 S/s) a průměrný tah se počítají
+  mezi začátkem a koncem. Stejné pravidlo používá i `gui/rampa_record.py` pro plný záznam z USB.
+
+**Co se pošle:** výřez od *začátek − 0,25 s* do *konec + 0,5 s*, 50 Hz (výřez nad 30 s 20 Hz), každý bod je
+průměr tahu a tlaku za svůj interval; teploty jednou na blok. Bez zážehu (nezažehl) T-0 − 0,5 s … + 3 s,
+zkušební záznam bez tahu celý. Bloky po 40 bodech (188 B, ~0,14 s na vzduchu) jdou **za sebou v jedné dávce**
+(mezi bloky 40 ms poslech, každý 8. paket telemetrie); stanice pak **znovu vyžádá jen chybějící bloky**
+(nejvýš 30 kol / 90 s). Zážeh 10 s ≈ 14 bloků ≈ **3 s** na vzduchu, se ztrátami pár sekund navíc.
+Ručně: tlačítko *Stáhnout zážeh* / `CMD BURN [první blok] [počet]`.
 
 **ABORT** (stanice, `Ctrl+Shift+A`, tlačítko BC na stanici, tlačítko SW1 na rampě) funguje vždy. Odpočet se
 **sám přeruší**, když rampa 2,5 s neslyší stanici, při vypnutí klíče, ztrátě kontinuity, poklesu baterie,
