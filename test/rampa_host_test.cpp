@@ -8,13 +8,20 @@
 #include "SPI.h"
 #include "LoRa.h"
 
-uint32_t g_ms = 0;
+uint32_t g_ms = 0, g_us_sub = 0;
 int g_pin[32];
+int g_adc = 0;
+int g_servo_us[32];
+// remote arming switch: closed when servo 1 (GP27) has been at >= 1800 us for 300 ms AND the human switch is on
+static bool g_servo_sim = false, g_human = true;
+static uint32_t g_servo_at_ms = 0;
+void (*g_pin_hook)(int, int) = nullptr;
 StubPrint Serial;
 StubUart Serial1;
 TwoWire Wire(false), Wire1(true);
-StubSPI SPI1;
+StubSPI SPI1, SPI;
 StubLoRa LoRa;
+int StubLoRa::endPacket(bool) { txc++; tx.push_back({ txbuf, g_ms }); return 1; }
 
 // ---------------------------------------------------------------- simulated pad hardware
 static uint8_t g_tca_out = 0;
@@ -44,20 +51,45 @@ int TwoWire::requestFrom(int a, int n)
 }
 
 #include "../Rampa_MCU/Rampa_MCU.ino"
+#include "stand_sim.h"
 
 static int g_fail = 0;
-#define CHECK(c, ...) do { printf((c) ? "   ok:   " : "   FAIL: "); printf(__VA_ARGS__); printf("\n"); if (!(c)) g_fail++; } while (0)
+#define CHECK(c, ...) do { const bool ok_ = (c); printf(ok_ ? "   ok:   " : "   FAIL: "); printf(__VA_ARGS__); printf("\n"); if (!ok_) g_fail++; } while (0)
 
-static void run_ms(uint32_t ms) { for (uint32_t i = 0; i < ms; i++) { g_ms++; loop(); } }
+static void run_ms(uint32_t ms)
+{
+    for (uint32_t i = 0; i < ms; i++) {
+        g_ms++;
+        for (uint32_t sub = 0; sub < 1000; sub += 250) { g_us_sub = sub; sim_step(); loop1(); }
+        g_us_sub = 0;
+        sim_step();
+        if (g_servo_sim) {
+            const bool at = g_servo_us[27] >= 1800;
+            if (!at) g_servo_at_ms = 0; else if (!g_servo_at_ms) g_servo_at_ms = g_ms;
+            g_key = g_human && at && g_ms - g_servo_at_ms >= 300;
+        }
+        loop();
+    }
+}
 
 static void reset_rampa()
 {
     memset(g_pin, 0, sizeof g_pin);
-    g_ms = 1000; g_tca_out = 0; g_key = true; g_btn = false; g_vbat_mv = 8000; g_cont_mv = 1200;
+    g_ms += 5000; g_tca_out = 0;     // time only moves forward (the sketch keeps static timers) g_key = true; g_btn = false; g_vbat_mv = 8000; g_cont_mv = 1200;
     s_proto = P_NONE; s_port = PORT_OFF; s_state = ZR_ST_IDLE; s_latched = 0; s_cd = false; s_detached = false;
     s_fired_ms = 0; s_fire_end_ms = 0; s_detach_req = false; s_last_cmd_ms = 0; s_lora_on = false;
     Wire.slave_on = false; Serial1.on = false; Serial1.rx.clear(); Serial1.tx.clear();
+    sim_reset();
+    s_stand = false; s_sl = SL_ST_SAFE; s_sl_latched = 0; s_sl_rx_ms = 0; s_sl_usb_ms = 0; s_sl_seq = 0;
+    s_sl_hang = false; s_sl_res_tx = 0; s_sl_curve_off = -1; s_sl_stop_req = false; s_lora_free_at = 0; s_lora_rx = false;
+    ts_rec = TR_IDLE; ts_req = TQ_NONE; ts_req_id = ts_ack_id = 0; ts_res_ready = false; ts_tared = false;
+    ts_avg_what = TQ_NONE; ts_fire_on = false; ts_t0_req = false; ts_th_phase = 0; ts_lb_n = 0;
+    LoRa.rx.clear(); LoRa.tx.clear(); Serial.out.clear(); Serial.in.clear();
+    s_as = AS_SAFE; s_as_req = 0; s_as_cfg_servo = 0xFF; s_as_fail_latch = false; s_armtest = 0; s_as_hold_ms = 0;
+    for (int i = 0; i < 4; i++) { s_servo[i].pin = -1; s_servo_us[i] = 0; }
+    memset(g_servo_us, 0, sizeof g_servo_us); g_servo_sim = false; g_human = true; g_servo_at_ms = 0;
     setup();
+    setup1();
 }
 
 // ---------------------------------------------------------------- Ariadna (Daidalos)
@@ -193,10 +225,16 @@ static void test_zenith()
     CHECK(s_proto == P_NONE && s_lora_on, "standalone: LoRa beacon on");
 }
 
+#include "stand_test.h"
+#include "servo_test.h"
+
 int main()
 {
+    setvbuf(stdout, nullptr, _IONBF, 0);
     test_ariadna();
     test_zenith();
+    test_stand();
+    test_servo();
     printf("\n%s (%d failures)\n", g_fail ? "RAMPA TEST FAILED" : "RAMPA TEST PASSED", g_fail);
     return g_fail ? 1 : 0;
 }
