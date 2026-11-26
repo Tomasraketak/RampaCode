@@ -117,9 +117,9 @@ static volatile uint32_t s_fire_end_ms = 0, s_fired_ms = 0;
 static volatile bool     s_detach_req = false;     // Ariadna: float GP0/GP1 after the COMMITTED read
 static volatile uint32_t s_evt = 0;                // events to print from the main loop
 
-static uint8_t  s_exp_out = 0;
-static bool     s_exp_ok = false, s_ina_ok = false, s_ads_ok = false;
-static volatile uint16_t s_vbat_mv = 0, s_umb_ma = 0;
+static uint8_t  s_exp_out = 0, s_exp_in = 0;
+static bool     s_exp_ok = false, s_ina_ok = false, s_ina_umb_ok = false, s_ads_ok = false;
+static volatile uint16_t s_vbat_mv = 0, s_ibat_ma = 0, s_umb_mv = 0, s_umb_ma = 0, s_v5_mv = 0;
 static volatile uint16_t s_cont_mv[3] = { 0, 0, 0 };
 static volatile bool     s_key = false, s_btn = false;
 static bool     s_rocket_pwr = true;               // user wish (GS command); actual output also needs proto
@@ -130,9 +130,22 @@ static uint32_t s_detach_ms = 0;
 static uint32_t s_scan_slot_ms = 0;
 static uint32_t s_boot_ms = 0;
 
-static bool     s_lora_on = false;
+static bool     s_lora_on = false, s_lora_ok = false;
+static uint32_t s_lora_tx_cnt = 0, s_lora_rx_cnt = 0;
+static bool     s_lora_beacon_now = false;
 static uint8_t  s_ul_seq = 0, s_ul_rc = ZL_RC_NONE;
 static bool     s_locate = false;
+
+// USB standalone diagnostics (never active while a rocket is locked or in countdown/fire)
+static bool     s_usb_stream = false;
+static bool     s_diag = false;
+static bool     s_diag_arm = false;
+static uint8_t  s_diag_fire_ch = 0;
+static uint32_t s_diag_fire_end = 0;
+static uint32_t s_diag_buzz_end = 0;
+static int8_t   s_diag_led = -1;                   // -1 auto, 0 off, 1 on
+static int8_t   s_diag_rgb = -1;                   // -1 auto, 0 off, 1..7 R/G/B/Y/C/M/W
+static int8_t   s_diag_lora = -1;                  // -1 auto, 0 off, 1 on
 
 static uint8_t  s_i2c_tx[ARIADNA_RAMPA_STAT_SIZE];  // Ariadna status served from the ISR
 
@@ -199,6 +212,7 @@ static void sensors_update(uint32_t now)
         if (i2c_r16(ADDR_ADS, 0x01, &cfg) && (cfg & 0x8000u) && i2c_r16(ADDR_ADS, 0x00, &raw)) {
             int16_t sr = (int16_t)raw; if (sr < 0) sr = 0;
             if (ch < 3) s_cont_mv[ch] = (uint16_t)((uint32_t)sr >> 3);
+            else s_v5_mv = (uint16_t)(((uint32_t)sr >> 3) * 2u);   // AIN3 = 5V_SENS/2
             ch = (uint8_t)((ch + 1u) & 3u);
             ads_start(ch);
         }
@@ -207,12 +221,19 @@ static void sensors_update(uint32_t now)
     next = now + 20;
     uint8_t in = 0;
     if (i2c_r8(ADDR_TCA, 0x00, &in)) {
+        s_exp_ok = true;
+        s_exp_in = in;
         s_key = (in & EXP_KEY) != 0;
         s_btn = (in & EXP_BTN) == 0;
     } else { s_key = false; s_exp_ok = false; }
-    uint16_t v = 0, c = 0;
+    uint16_t v = 0, ib = 0, uv = 0, c = 0;
     s_ina_ok = i2c_r16(ADDR_INA_BAT, 0x02, &v);
-    if (s_ina_ok) s_vbat_mv = (uint16_t)(((uint32_t)v * 125u) / 100u);
+    if (s_ina_ok) {
+        s_vbat_mv = (uint16_t)(((uint32_t)v * 125u) / 100u);
+        if (i2c_r16(ADDR_INA_BAT, 0x04, &ib)) s_ibat_ma = (int16_t)ib < 0 ? 0 : ib;
+    }
+    s_ina_umb_ok = i2c_r16(ADDR_INA_UMB, 0x02, &uv);
+    if (s_ina_umb_ok) s_umb_mv = (uint16_t)(((uint32_t)uv * 125u) / 100u);
     if (i2c_r16(ADDR_INA_UMB, 0x04, &c)) s_umb_ma = (int16_t)c < 0 ? 0 : c;
 }
 
@@ -542,10 +563,14 @@ static void lora_power(bool on)
             LoRa.enableCrc();
             LoRa.idle();
             s_lora_on = true;
+            s_lora_ok = true;
             Serial.println("LoRa ON (no rocket on the umbilical)");
+            if (s_usb_stream) Serial.printf("$EV,%lu,LoRa ON\n", (unsigned long)millis());
         } else {
             exp_write((uint8_t)(s_exp_out & ~(EXP_LORA_EN | EXP_LORA_RST)));
+            s_lora_ok = false;
             Serial.println("LoRa init failed");
+            if (s_usb_stream) Serial.printf("$EV,%lu,LoRa init failed\n", (unsigned long)millis());
         }
     } else {
         LoRa.end();
@@ -553,6 +578,7 @@ static void lora_power(bool on)
         exp_write((uint8_t)(s_exp_out & ~(EXP_LORA_EN | EXP_LORA_RST)));
         s_lora_on = false;
         Serial.println("LoRa OFF (rocket on the umbilical)");
+        if (s_usb_stream) Serial.printf("$EV,%lu,LoRa OFF\n", (unsigned long)millis());
     }
 }
 
@@ -578,7 +604,7 @@ static void lora_service(uint32_t now)
     static uint32_t next_beacon = 0;
     static bool rx = false, ack = false;
     if (!s_lora_on) return;
-    if ((now % ZL_WIN_PERIOD_MS) < ZL_WIN_DUR_MS) {
+    if (!s_lora_beacon_now && (now % ZL_WIN_PERIOD_MS) < ZL_WIN_DUR_MS) {
         if (!rx) { LoRa.receive(); rx = true; }
         const int sz = LoRa.parsePacket();
         if (sz > 0) {
@@ -591,7 +617,9 @@ static void lora_service(uint32_t now)
                 if (u.dest == ZL_UL_DEST_RAMPA && u.seq != s_ul_seq) {
                     s_ul_rc = rampa_uplink(u);
                     s_ul_seq = u.seq;
+                    s_lora_rx_cnt++;
                     Serial.printf("UPLINK cmd %u arg %ld -> rc %u\n", u.cmd, (long)u.arg, s_ul_rc);
+                    if (s_usb_stream) Serial.printf("$EV,%lu,UPLINK cmd %u arg %ld -> rc %u\n", (unsigned long)now, u.cmd, (long)u.arg, s_ul_rc);
                     ack = true;
                 }
             }
@@ -600,8 +628,10 @@ static void lora_service(uint32_t now)
     }
     if (rx) { LoRa.idle(); rx = false; }
     int fin = 0;
-    if (zl_next_window_ms(now, -1, &fin) < ZL_WIN_TX_GUARD_MS) return;
-    if (!ack && (int32_t)(now - next_beacon) < 0) return;
+    if (!s_lora_beacon_now) {
+        if (zl_next_window_ms(now, -1, &fin) < ZL_WIN_TX_GUARD_MS) return;
+        if (!ack && (int32_t)(now - next_beacon) < 0) return;
+    }
     zl_rampa_beacon_t b = {};
     b.state = s_state; b.flags = s_flags; b.t_ms = now;
     b.vbat_mv = s_vbat_mv; b.umb_ma = s_umb_ma;
@@ -611,14 +641,27 @@ static void lora_service(uint32_t now)
     b.last_ul_seq = s_ul_seq; b.last_ul_rc = s_ul_rc;
     b.fw = (uint8_t)(ZENITH_FW_VERSION & 0xFF);
     zl_lora_seal(&b, sizeof b, ZL_BEACON_MAGIC);
-    if (LoRa.beginPacket()) { LoRa.write((const uint8_t *)&b, sizeof b); LoRa.endPacket(false); }
+    if (LoRa.beginPacket()) { LoRa.write((const uint8_t *)&b, sizeof b); LoRa.endPacket(false); s_lora_tx_cnt++; }
     ack = false;
+    s_lora_beacon_now = false;
     next_beacon = now + 1000;
 }
 
 // =====================================================================
-//  10. ANNUNCIATORS
+//  10. ANNUNCIATORS & USB STANDALONE DIAGNOSTICS
 // =====================================================================
+static void diag_exit(bool stop_pyro)
+{
+    s_diag = false;
+    s_diag_arm = false;
+    s_diag_fire_ch = 0;
+    s_diag_fire_end = 0;
+    s_diag_led = -1;
+    s_diag_rgb = -1;
+    s_diag_lora = -1;
+    if (stop_pyro) pyro_off();
+}
+
 static void outputs_update(uint32_t now)
 {
     uint8_t out = (uint8_t)(s_exp_out & (EXP_LORA_EN | EXP_LORA_RST));
@@ -642,6 +685,18 @@ static void outputs_update(uint32_t now)
         break;
     }
     if (s_locate && (now % 2000u) < 500u) out |= EXP_BUZZER;
+    if (s_diag_buzz_end) {
+        if ((int32_t)(now - s_diag_buzz_end) < 0) out |= EXP_BUZZER;
+        else s_diag_buzz_end = 0;
+    }
+    if (s_diag) {
+        if (s_diag_led == 1) out |= EXP_FIRE_LED;
+        else if (s_diag_led == 0) out &= (uint8_t)~EXP_FIRE_LED;
+        static const uint32_t RGB_MAP[8] = {
+            0x000000, 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFFFFF
+        };
+        if (s_diag_rgb >= 0 && s_diag_rgb < 8) c = RGB_MAP[s_diag_rgb];
+    }
     exp_write(out);
     static uint32_t c_last = 0xFFFFFFFF;
     if (c != c_last) { s_rgb.setPixelColor(0, s_rgb.Color((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)); s_rgb.show(); c_last = c; }
@@ -654,14 +709,267 @@ static void print_events(void)
     s_evt = 0;
     interrupts();
     if (!e) return;
-    if (e & EVT_LOCK_Z)   Serial.println("ROCKET: Zenith (UART 115200)");
-    if (e & EVT_LOCK_A)   Serial.println("ROCKET: Daidalos / Ariadna V2 (I2C slave 0x2B)");
-    if (e & EVT_UNLOCK)   Serial.println("ROCKET: none (scanning I2C / UART)");
-    if (e & EVT_ABORT)    Serial.printf("ABORT faults 0x%02X\n", s_latched | s_faults);
-    if (e & EVT_COMMIT)   Serial.printf("COMMITTED, T-%ld ms\n", (long)(int32_t)(s_t0_ms - millis()));
-    if (e & EVT_DETACH)   Serial.println("Ariadna umbilical detached (GP0/GP1 Hi-Z)");
-    if (e & EVT_FIRE)     Serial.printf("FIRE channel %u for %u ms\n", s_pyro_ch, s_fire_ms);
-    if (e & EVT_UMB_TRIP) Serial.printf("UMB_5V overcurrent %u mA -> rocket supply OFF\n", s_umb_ma);
+    const unsigned long t = (unsigned long)millis();
+    if (e & EVT_LOCK_Z)   { Serial.println("ROCKET: Zenith (UART 115200)"); if (s_usb_stream) Serial.printf("$EV,%lu,ROCKET: Zenith (UART 115200)\n", t); }
+    if (e & EVT_LOCK_A)   { Serial.println("ROCKET: Daidalos / Ariadna V2 (I2C slave 0x2B)"); if (s_usb_stream) Serial.printf("$EV,%lu,ROCKET: Daidalos / Ariadna V2 (I2C 0x2B)\n", t); }
+    if (e & EVT_UNLOCK)   { Serial.println("ROCKET: none (scanning I2C / UART)"); if (s_usb_stream) Serial.printf("$EV,%lu,ROCKET: none (scanning)\n", t); }
+    if (e & EVT_ABORT)    { Serial.printf("ABORT faults 0x%02X\n", s_latched | s_faults); if (s_usb_stream) Serial.printf("$EV,%lu,ABORT faults 0x%02X\n", t, s_latched | s_faults); }
+    if (e & EVT_COMMIT)   { Serial.printf("COMMITTED, T-%ld ms\n", (long)(int32_t)(s_t0_ms - millis())); if (s_usb_stream) Serial.printf("$EV,%lu,COMMITTED T-%ld ms\n", t, (long)(int32_t)(s_t0_ms - millis())); }
+    if (e & EVT_DETACH)   { Serial.println("Ariadna umbilical detached (GP0/GP1 Hi-Z)"); if (s_usb_stream) Serial.printf("$EV,%lu,Ariadna umbilical detached\n", t); }
+    if (e & EVT_FIRE)     { Serial.printf("FIRE channel %u for %u ms\n", s_pyro_ch, s_fire_ms); if (s_usb_stream) Serial.printf("$EV,%lu,FIRE ch %u (%u ms)\n", t, s_pyro_ch, s_fire_ms); }
+    if (e & EVT_UMB_TRIP) { Serial.printf("UMB_5V overcurrent %u mA -> rocket supply OFF\n", s_umb_ma); if (s_usb_stream) Serial.printf("$EV,%lu,UMB_5V overcurrent %u mA\n", t, s_umb_ma); }
+}
+
+static void usb_send_status(uint32_t now)
+{
+    if (Serial.availableForWrite() < 160) return;
+    const uint8_t hw_mask = (uint8_t)((s_exp_ok ? 1u : 0u) |
+                                      (s_ina_ok ? 2u : 0u) |
+                                      (s_ina_umb_ok ? 4u : 0u) |
+                                      (s_ads_ok ? 8u : 0u) |
+                                      (s_lora_ok ? 16u : 0u));
+    const uint8_t fire_mask = (uint8_t)((digitalRead(PIN_FIRE[0]) ? 1u : 0u) |
+                                        (digitalRead(PIN_FIRE[1]) ? 2u : 0u) |
+                                        (digitalRead(PIN_FIRE[2]) ? 4u : 0u));
+    const int32_t t_rem = s_cd ? (int32_t)(s_t0_ms - now) : -1;
+    const int32_t cmd_age = s_last_cmd_ms ? (int32_t)(now - s_last_cmd_ms) : -1;
+    Serial.printf("$S,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%ld,%u,%u,%u,%ld,%u,%u,%lu,%lu\n",
+                  (unsigned long)now, (unsigned)s_proto, (unsigned)s_port, (unsigned)s_state,
+                  (unsigned)s_flags, (unsigned)(s_faults | s_latched), (unsigned)hw_mask,
+                  (unsigned)s_vbat_mv, (unsigned)s_ibat_ma, (unsigned)s_umb_mv, (unsigned)s_umb_ma,
+                  (unsigned)s_v5_mv, (unsigned)s_cont_mv[0], (unsigned)s_cont_mv[1], (unsigned)s_cont_mv[2],
+                  s_key ? 1 : 0, s_btn ? 1 : 0, digitalRead(PIN_PYRO_ARM) ? 1 : 0, (unsigned)fire_mask,
+                  s_lora_on ? 1 : 0, s_rocket_pwr ? 1 : 0, s_umb_trip ? 1 : 0, s_locate ? 1 : 0,
+                  s_diag ? 1 : 0, s_diag_arm ? 1 : 0, (long)t_rem, (unsigned)s_pyro_ch, (unsigned)s_fire_ms,
+                  (unsigned)s_last_seq, (long)cmd_age, (unsigned)s_exp_in, (unsigned)s_exp_out,
+                  (unsigned long)s_lora_tx_cnt, (unsigned long)s_lora_rx_cnt);
+}
+
+static bool tok_eq(const char *a, const char *b)
+{
+    while (*a && *b) {
+        char ca = (*a >= 'a' && *a <= 'z') ? (char)(*a - 32) : *a;
+        char cb = (*b >= 'a' && *b <= 'z') ? (char)(*b - 32) : *b;
+        if (ca != cb) return false;
+        a++; b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static void usb_handle_cmd(char *line, uint32_t now)
+{
+    char *tok[5] = {};
+    int nt = 0;
+    char *p = line;
+    while (*p && nt < 5) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        tok[nt++] = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) *p++ = 0;
+    }
+    if (nt == 0) return;
+
+    if (tok_eq(tok[0], "HELLO")) {
+        s_usb_stream = true;
+        Serial.printf("$ID,Rampa PCB1,%u,Zenith+Daidalos\n", (unsigned)ZENITH_FW_VERSION);
+        usb_send_status(now);
+        return;
+    }
+    if (tok_eq(tok[0], "STATUS") || tok_eq(tok[0], "PING")) {
+        usb_send_status(now);
+        return;
+    }
+    if (tok_eq(tok[0], "HELP")) {
+        Serial.println("#OK CMDS: HELLO STATUS STREAM DIAG ARM FIRE ROCKETPWR LOCATE BUZZ LED RGB LORA I2C ABORT SAFE");
+        return;
+    }
+    if (tok_eq(tok[0], "STREAM") && nt >= 2) {
+        s_usb_stream = atoi(tok[1]) != 0;
+        Serial.printf("#OK STREAM %d\n", s_usb_stream ? 1 : 0);
+        return;
+    }
+    if (tok_eq(tok[0], "ABORT")) {
+        noInterrupts();
+        diag_exit(true);
+        enter_abort(0);
+        interrupts();
+        Serial.println("#OK ABORT");
+        return;
+    }
+    if (tok_eq(tok[0], "SAFE")) {
+        noInterrupts();
+        diag_exit(true);
+        pyro_off();
+        s_cd = false;
+        s_latched = 0;
+        if (s_state != ZR_ST_FIRED || (uint32_t)(now - s_fired_ms) > 2000u) s_state = ZR_ST_IDLE;
+        interrupts();
+        Serial.println("#OK SAFE");
+        if (s_usb_stream) Serial.printf("$EV,%lu,USB SAFE -> IDLE\n", (unsigned long)now);
+        return;
+    }
+    if (tok_eq(tok[0], "ROCKETPWR") && nt >= 2) {
+        s_rocket_pwr = atoi(tok[1]) != 0;
+        s_umb_trip = false;
+        Serial.printf("#OK ROCKETPWR %d\n", s_rocket_pwr ? 1 : 0);
+        if (s_usb_stream) Serial.printf("$EV,%lu,USB ROCKETPWR %d\n", (unsigned long)now, s_rocket_pwr ? 1 : 0);
+        return;
+    }
+    if (tok_eq(tok[0], "LOCATE") && nt >= 2) {
+        s_locate = atoi(tok[1]) != 0;
+        Serial.printf("#OK LOCATE %d\n", s_locate ? 1 : 0);
+        return;
+    }
+    if (tok_eq(tok[0], "BUZZ")) {
+        long ms = nt >= 2 ? atol(tok[1]) : 300;
+        if (ms < 50) ms = 50;
+        if (ms > 5000) ms = 5000;
+        s_diag_buzz_end = now + (uint32_t)ms;
+        Serial.printf("#OK BUZZ %ld\n", ms);
+        return;
+    }
+    if (tok_eq(tok[0], "I2C") && nt >= 2 && tok_eq(tok[1], "SCAN")) {
+        if (critical_state()) { Serial.println("#ERR I2C SCAN blocked in countdown/fire"); return; }
+        char out[128];
+        int pos = snprintf(out, sizeof out, "$I2C");
+        int found = 0;
+        for (uint8_t a = 0x08; a <= 0x77; a++) {
+            watchdog_update();
+            Wire1.beginTransmission(a);
+            if (Wire1.endTransmission() == 0) {
+                found++;
+                if (pos < (int)sizeof(out) - 6) pos += snprintf(out + pos, sizeof(out) - (size_t)pos, ",0x%02X", a);
+            }
+        }
+        Serial.println(out);
+        Serial.printf("#OK I2C SCAN %d\n", found);
+        return;
+    }
+    if (tok_eq(tok[0], "DIAG") && nt >= 2) {
+        const bool on = atoi(tok[1]) != 0;
+        if (!on) {
+            noInterrupts(); diag_exit(true); interrupts();
+            Serial.println("#OK DIAG 0");
+            if (s_usb_stream) Serial.printf("$EV,%lu,DIAG mode OFF\n", (unsigned long)now);
+            return;
+        }
+        if (critical_state() || s_proto != P_NONE) {
+            Serial.println("#ERR DIAG requires standalone IDLE/FAULT/ABORT (no rocket)");
+            return;
+        }
+        s_diag = true;
+        Serial.println("#OK DIAG 1");
+        if (s_usb_stream) Serial.printf("$EV,%lu,DIAG mode ON\n", (unsigned long)now);
+        return;
+    }
+    if (tok_eq(tok[0], "ARM") && nt >= 2) {
+        const bool on = atoi(tok[1]) != 0;
+        if (!on) {
+            noInterrupts();
+            s_diag_arm = false; s_diag_fire_ch = 0; s_diag_fire_end = 0;
+            if (s_diag) pyro_off();
+            interrupts();
+            Serial.println("#OK ARM 0");
+            if (s_usb_stream) Serial.printf("$EV,%lu,DIAG pyro rail OFF\n", (unsigned long)now);
+            return;
+        }
+        if (!s_diag) { Serial.println("#ERR ARM requires DIAG 1"); return; }
+        if (!s_key)  { Serial.println("#ERR ARM key switch J4 is OFF"); return; }
+        if (s_btn)   { Serial.println("#ERR ARM abort button SW1 pressed"); return; }
+        if (s_vbat_mv < VBAT_MIN_MV) { Serial.println("#ERR ARM low battery"); return; }
+        s_diag_arm = true;
+        Serial.println("#OK ARM 1");
+        if (s_usb_stream) Serial.printf("$EV,%lu,DIAG pyro rail ARMED\n", (unsigned long)now);
+        return;
+    }
+    if (tok_eq(tok[0], "FIRE") && nt >= 3) {
+        const int ch = atoi(tok[1]);
+        long ms = 300;
+        bool confirmed = false;
+        if (nt == 3 && tok_eq(tok[2], "CONFIRM")) {
+            confirmed = true;
+        } else if (nt >= 4 && tok_eq(tok[3], "CONFIRM")) {
+            ms = atol(tok[2]);
+            confirmed = true;
+        }
+        if (!confirmed) { Serial.println("#ERR FIRE syntax: FIRE <1..3> [ms] CONFIRM"); return; }
+        if (ch < 1 || ch > 3) { Serial.println("#ERR FIRE channel must be 1..3"); return; }
+        if (!s_diag || !s_diag_arm) { Serial.println("#ERR FIRE requires DIAG 1 and ARM 1"); return; }
+        if (!s_key) { Serial.println("#ERR FIRE key switch J4 is OFF"); return; }
+        if (s_btn)  { Serial.println("#ERR FIRE abort button SW1 pressed"); return; }
+        if (s_vbat_mv < VBAT_MIN_MV) { Serial.println("#ERR FIRE low battery"); return; }
+        if (ms < 50) ms = 50;
+        if (ms > 2000) ms = 2000;
+        noInterrupts();
+        for (int i = 0; i < 3; i++) digitalWrite(PIN_FIRE[i], LOW);
+        digitalWrite(PIN_PYRO_ARM, HIGH);
+        digitalWrite(PIN_FIRE[ch - 1], HIGH);
+        s_diag_fire_ch = (uint8_t)ch;
+        s_diag_fire_end = now + (uint32_t)ms;
+        interrupts();
+        Serial.printf("#OK FIRE %d %ld\n", ch, ms);
+        if (s_usb_stream) Serial.printf("$EV,%lu,DIAG FIRE ch %d (%ld ms)\n", (unsigned long)now, ch, ms);
+        return;
+    }
+    if (tok_eq(tok[0], "LED") && nt >= 2) {
+        if (!s_diag) { Serial.println("#ERR LED requires DIAG 1"); return; }
+        if (tok_eq(tok[1], "AUTO")) s_diag_led = -1;
+        else s_diag_led = atoi(tok[1]) != 0 ? 1 : 0;
+        Serial.printf("#OK LED %s\n", tok[1]);
+        return;
+    }
+    if (tok_eq(tok[0], "RGB") && nt >= 2) {
+        if (!s_diag) { Serial.println("#ERR RGB requires DIAG 1"); return; }
+        if (tok_eq(tok[1], "AUTO")) s_diag_rgb = -1;
+        else if (tok_eq(tok[1], "OFF")) s_diag_rgb = 0;
+        else if (tok_eq(tok[1], "R")) s_diag_rgb = 1;
+        else if (tok_eq(tok[1], "G")) s_diag_rgb = 2;
+        else if (tok_eq(tok[1], "B")) s_diag_rgb = 3;
+        else if (tok_eq(tok[1], "Y")) s_diag_rgb = 4;
+        else if (tok_eq(tok[1], "C")) s_diag_rgb = 5;
+        else if (tok_eq(tok[1], "M")) s_diag_rgb = 6;
+        else if (tok_eq(tok[1], "W")) s_diag_rgb = 7;
+        else { Serial.println("#ERR RGB use AUTO|OFF|R|G|B|Y|C|M|W"); return; }
+        Serial.printf("#OK RGB %s\n", tok[1]);
+        return;
+    }
+    if (tok_eq(tok[0], "LORA") && nt >= 2) {
+        if (!s_diag) { Serial.println("#ERR LORA requires DIAG 1"); return; }
+        if (tok_eq(tok[1], "AUTO")) s_diag_lora = -1;
+        else if (tok_eq(tok[1], "OFF")) { s_diag_lora = 0; lora_power(false); }
+        else if (tok_eq(tok[1], "ON")) { s_diag_lora = 1; lora_power(true); }
+        else if (tok_eq(tok[1], "BEACON")) {
+            s_diag_lora = 1;
+            if (!s_lora_on) lora_power(true);
+            if (!s_lora_on) { Serial.println("#ERR LORA init failed"); return; }
+            s_lora_beacon_now = true;
+        } else { Serial.println("#ERR LORA use AUTO|ON|OFF|BEACON"); return; }
+        Serial.printf("#OK LORA %s\n", tok[1]);
+        return;
+    }
+
+    Serial.printf("#ERR unknown command: %s\n", tok[0]);
+}
+
+static void usb_poll(uint32_t now)
+{
+    static char buf[96];
+    static uint8_t len = 0;
+    int budget = 128;
+    while (Serial.available() && budget-- > 0) {
+        const int ch = Serial.read();
+        if (ch < 0) break;
+        if (ch == '\r' || ch == '\n') {
+            if (len > 0) {
+                buf[len] = 0;
+                len = 0;
+                usb_handle_cmd(buf, now);
+            }
+        } else if ((size_t)(len + 1u) < sizeof buf) {
+            buf[len++] = (char)ch;
+        }
+    }
 }
 
 // =====================================================================
@@ -702,11 +1010,35 @@ void loop()
 
     if (s_port == PORT_UART) zenith_poll();
     umbilical_service(now);
+    usb_poll(now);
 
     // ---- supervision (masked against the I2C slave interrupt) -------------------
     noInterrupts();
-    if (s_btn && (s_state == ZR_ST_READY || s_state == ZR_ST_COUNTDOWN || s_state == ZR_ST_COMMITTED))
+    if (s_btn && (s_state == ZR_ST_READY || s_state == ZR_ST_COUNTDOWN || s_state == ZR_ST_COMMITTED || s_diag)) {
+        diag_exit(true);
         enter_abort(ZL_RMPF_BTN_ABORT);
+    }
+    if (s_diag) {
+        if (s_proto != P_NONE || s_state == ZR_ST_COUNTDOWN || s_state == ZR_ST_COMMITTED || s_state == ZR_ST_FIRED) {
+            diag_exit(s_state != ZR_ST_FIRED && s_state != ZR_ST_COMMITTED);
+        } else {
+            if (s_diag_arm && (!s_key || s_vbat_mv < VBAT_MIN_MV)) {
+                s_diag_arm = false;
+                s_diag_fire_ch = 0;
+                s_diag_fire_end = 0;
+                pyro_off();
+            }
+            if (s_diag_fire_end && (int32_t)(now - s_diag_fire_end) >= 0) {
+                for (int i = 0; i < 3; i++) digitalWrite(PIN_FIRE[i], LOW);
+                s_diag_fire_ch = 0;
+                s_diag_fire_end = 0;
+            }
+            digitalWrite(PIN_PYRO_ARM, s_diag_arm ? HIGH : LOW);
+            if (!s_diag_fire_end) {
+                for (int i = 0; i < 3; i++) digitalWrite(PIN_FIRE[i], LOW);
+            }
+        }
+    }
     if (s_state == ZR_ST_COUNTDOWN) {
         if ((uint32_t)(now - s_last_cmd_ms) > LINK_TIMEOUT_MS) enter_abort(ZL_RMPF_TIMEOUT);
         else if (!s_rocket_go) enter_abort(ZL_RMPF_ROCKET);
@@ -731,7 +1063,7 @@ void loop()
         if (s_fire_end_ms && (int32_t)(now - s_fire_end_ms) >= 0) { pyro_off(); s_fire_end_ms = 0; }
         if (!s_fire_end_ms && (uint32_t)(now - s_fired_ms) > POST_FIRE_MS) s_state = ZR_ST_IDLE;
     }
-    if (s_state != ZR_ST_FIRED && s_state != ZR_ST_COMMITTED && digitalRead(PIN_PYRO_ARM)) pyro_off();
+    if (!s_diag && s_state != ZR_ST_FIRED && s_state != ZR_ST_COMMITTED && digitalRead(PIN_PYRO_ARM)) pyro_off();
     if (s_port == PORT_I2C) ariadna_refresh_tx(now);
     interrupts();
 
@@ -742,7 +1074,9 @@ void loop()
     static uint32_t no_rocket_since = 0;
     const bool rocket = s_proto != P_NONE || s_detached;
     if (rocket) { no_rocket_since = 0; if (s_lora_on) lora_power(false); }
-    else {
+    else if (s_diag && s_diag_lora >= 0) {
+        lora_power(s_diag_lora == 1);
+    } else {
         if (!no_rocket_since) no_rocket_since = now ? now : 1;
         // after a launch the rocket owns the 433 MHz channel: stay silent
         const bool quiet = s_state != ZR_ST_COMMITTED && s_state != ZR_ST_COUNTDOWN &&
@@ -753,6 +1087,12 @@ void loop()
 
     outputs_update(now);
     print_events();
+
+    static uint32_t t_usb = 0;
+    if (s_usb_stream && (int32_t)(now - t_usb) >= 0) {
+        t_usb = now + 100;
+        usb_send_status(now);
+    }
 
     static uint32_t t_dbg = 0;
     if ((int32_t)(now - t_dbg) >= 0) {

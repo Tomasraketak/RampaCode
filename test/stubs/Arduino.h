@@ -23,11 +23,27 @@ inline void digitalWrite(int p, int v) { g_pin[p] = v; }
 inline int digitalRead(int p) { return g_pin[p]; }
 inline void noInterrupts() {}
 inline void interrupts() {}
+#include <string>
 struct StubPrint {
     bool quiet = true;
+    std::deque<uint8_t> rx;
+    std::string tx;
     void begin(unsigned long) {}
-    int printf(const char *f, ...) { if (quiet) return 0; va_list a; va_start(a, f); int r = vprintf(f, a); va_end(a); return r; }
-    void println(const char *s) { if (!quiet) puts(s); }
+    int available() { return (int)rx.size(); }
+    int read() { if (rx.empty()) return -1; int b = rx.front(); rx.pop_front(); return b; }
+    int availableForWrite() { return 4096; }
+    void feed(const char *s) { while (*s) rx.push_back((uint8_t)*s++); }
+    int printf(const char *f, ...) {
+        char buf[512];
+        va_list a; va_start(a, f); int r = vsnprintf(buf, sizeof buf, f, a); va_end(a);
+        tx.append(buf);
+        if (!quiet) fputs(buf, stdout);
+        return r;
+    }
+    void println(const char *s) {
+        tx.append(s); tx.push_back('\n');
+        if (!quiet) puts(s);
+    }
 };
 struct StubUart {
     std::deque<uint8_t> rx; std::vector<uint8_t> tx; bool on = false;

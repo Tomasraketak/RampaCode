@@ -24,10 +24,11 @@ static uint16_t g_vbat_mv = 8000, g_cont_mv = 1200;
 uint8_t TwoWire::endTransmission(bool)
 {
     if (!internal) return 0;
-    if (wbuf.empty()) return 2;
+    const bool present = (cur == 0x20 || cur == 0x40 || cur == 0x41 || cur == 0x48);
+    if (wbuf.empty()) return present ? 0 : 2;
     reg = wbuf[0];
     if (cur == 0x20 && reg == 0x01 && wbuf.size() >= 2) g_tca_out = wbuf[1];
-    return (cur == 0x20 || cur == 0x40 || cur == 0x41 || cur == 0x48) ? 0 : 2;
+    return present ? 0 : 2;
 }
 int TwoWire::requestFrom(int a, int n)
 {
@@ -35,6 +36,8 @@ int TwoWire::requestFrom(int a, int n)
     uint16_t v = 0;
     if (a == 0x20 && reg == 0x00) { uint8_t in = (uint8_t)((g_key ? 0x04 : 0) | (g_btn ? 0 : 0x80)); rbuf.push_back(in); return 1; }
     if (a == 0x40 && reg == 0x02) v = (uint16_t)(g_vbat_mv * 100u / 125u);
+    if (a == 0x40 && reg == 0x04) v = 240;
+    if (a == 0x41 && reg == 0x02) v = (g_tca_out & 0x02) ? (uint16_t)(5000u * 100u / 125u) : 0;
     if (a == 0x41 && reg == 0x04) v = (g_tca_out & 0x02) ? 180 : 0;
     if (a == 0x48 && reg == 0x01) v = 0x8000;
     if (a == 0x48 && reg == 0x00) v = (uint16_t)(g_cont_mv * 8u);
@@ -53,9 +56,12 @@ static void run_ms(uint32_t ms) { for (uint32_t i = 0; i < ms; i++) { g_ms++; lo
 static void reset_rampa()
 {
     memset(g_pin, 0, sizeof g_pin);
-    g_ms = 1000; g_tca_out = 0; g_key = true; g_btn = false; g_vbat_mv = 8000; g_cont_mv = 1200;
+    g_ms += 100000; g_tca_out = 0; g_key = true; g_btn = false; g_vbat_mv = 8000; g_cont_mv = 1200;
     s_proto = P_NONE; s_port = PORT_OFF; s_state = ZR_ST_IDLE; s_latched = 0; s_cd = false; s_detached = false;
-    s_fired_ms = 0; s_fire_end_ms = 0; s_detach_req = false; s_last_cmd_ms = 0; s_lora_on = false;
+    s_fired_ms = 0; s_fire_end_ms = 0; s_detach_req = false; s_last_cmd_ms = 0; s_lora_on = false; s_lora_ok = false;
+    s_lora_tx_cnt = 0; s_lora_rx_cnt = 0; s_lora_beacon_now = false; s_usb_stream = false; s_locate = false;
+    s_rocket_pwr = true; s_umb_trip = false; s_diag_buzz_end = 0; diag_exit(true);
+    Serial.rx.clear(); Serial.tx.clear();
     Wire.slave_on = false; Serial1.on = false; Serial1.rx.clear(); Serial1.tx.clear();
     setup();
 }
@@ -193,10 +199,91 @@ static void test_zenith()
     CHECK(s_proto == P_NONE && s_lora_on, "standalone: LoRa beacon on");
 }
 
+static void usb_cmd(const char *c)
+{
+    Serial.tx.clear();
+    Serial.feed(c);
+    Serial.feed("\n");
+    run_ms(5);
+}
+
+static void test_usb_diag()
+{
+    printf("== USB standalone diagnostics (no rocket / no ground station)\n");
+    reset_rampa();
+    run_ms(50);
+
+    usb_cmd("HELLO");
+    CHECK(Serial.tx.find("$ID,Rampa PCB1,") != std::string::npos, "HELLO returns $ID");
+    CHECK(Serial.tx.find("$S,") != std::string::npos, "HELLO returns immediate $S status");
+
+    usb_cmd("I2C SCAN");
+    CHECK(Serial.tx.find("$I2C,0x20,0x40,0x41,0x48") != std::string::npos, "I2C SCAN finds TCA/INA/ADS");
+
+    // Pyro ARM must be refused outside DIAG
+    usb_cmd("ARM 1");
+    CHECK(Serial.tx.find("#ERR") != std::string::npos && !g_pin[19], "ARM 1 rejected outside DIAG");
+
+    // Enter DIAG and test buzzer, LED, LoRa beacon, ARM and FIRE
+    usb_cmd("DIAG 1");
+    CHECK(Serial.tx.find("#OK DIAG 1") != std::string::npos && s_diag, "DIAG 1 enabled");
+
+    usb_cmd("BUZZ 100");
+    CHECK(Serial.tx.find("#OK BUZZ 100") != std::string::npos && (g_tca_out & EXP_BUZZER), "BUZZ 100 activates buzzer");
+    run_ms(120);
+    CHECK(!(g_tca_out & EXP_BUZZER), "buzzer turns off after 100 ms");
+
+    usb_cmd("LED 1");
+    CHECK((g_tca_out & EXP_FIRE_LED) != 0, "LED 1 activates fire warning light");
+    usb_cmd("LED AUTO");
+
+    const uint32_t tx_before = s_lora_tx_cnt;
+    usb_cmd("LORA BEACON");
+    run_ms(20);
+    CHECK(s_lora_on && s_lora_tx_cnt > tx_before, "LORA BEACON sends immediate test beacon");
+
+    // Key off blocks ARM
+    g_key = false; run_ms(30);
+    usb_cmd("ARM 1");
+    CHECK(Serial.tx.find("#ERR") != std::string::npos && !g_pin[19], "ARM 1 rejected when key J4 is OFF");
+
+    // Key on allows ARM and FIRE CONFIRM
+    g_key = true; run_ms(30);
+    usb_cmd("ARM 1");
+    CHECK(Serial.tx.find("#OK ARM 1") != std::string::npos && g_pin[19], "ARM 1 energises pyro rail in DIAG");
+    usb_cmd("FIRE 2 150 CONFIRM");
+    CHECK(Serial.tx.find("#OK FIRE 2 150") != std::string::npos && g_pin[19] && g_pin[17], "FIRE 2 150 CONFIRM fires CH2");
+    run_ms(170);
+    CHECK(!g_pin[17] && g_pin[19], "CH2 pulse ends after 150 ms while rail stays armed");
+
+    // Turning key OFF immediately disarms pyro rail
+    g_key = false; run_ms(30);
+    CHECK(!g_pin[19] && !s_diag_arm, "turning key OFF immediately disarms DIAG rail");
+
+    // Local ABORT button exits DIAG and enters ABORT
+    g_key = true; run_ms(30);
+    usb_cmd("ARM 1");
+    CHECK(g_pin[19], "re-armed in DIAG");
+    g_btn = true; run_ms(30); g_btn = false; run_ms(30);
+    CHECK(!s_diag && !g_pin[19] && s_state == ZR_ST_ABORT, "local ABORT button exits DIAG and disarms");
+
+    usb_cmd("SAFE");
+    CHECK(s_state == ZR_ST_IDLE, "USB SAFE returns to IDLE");
+
+    // Rocket connecting automatically exits DIAG
+    usb_cmd("DIAG 1");
+    CHECK(s_diag, "DIAG re-entered");
+    ariadna_rampa_status_t st{};
+    ariadna_xfer(RAMPA_CMD_PING, -1, &st);
+    run_ms(5);
+    CHECK(!s_diag && s_proto == P_ARIADNA, "rocket connecting automatically exits DIAG");
+}
+
 int main()
 {
     test_ariadna();
     test_zenith();
+    test_usb_diag();
     printf("\n%s (%d failures)\n", g_fail ? "RAMPA TEST FAILED" : "RAMPA TEST PASSED", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -11,11 +11,27 @@ Do **cmd** vlož tento jeden řádek a stiskni Enter:
 curl.exe -fsSL https://raw.githubusercontent.com/Tomasraketak/RampaCode/main/tools/windows/rampa_setup.cmd -o "%TEMP%\rampa_setup.cmd" && "%TEMP%\rampa_setup.cmd"
 ```
 
-Doinstaluje Git (pokud chybí), stáhne repo jako git klon do složky **`Rampa` na ploše** a vytvoří
-zástupce **„Rampa firmware“** s ikonou rampy. Každé kliknutí na zástupce **aktualizuje složku
-`Rampa` z GitHubu** (vlastní úpravy schová do `git stash`) a otevře `Rampa_MCU.ino` v Arduino IDE.
-Rampa nemá vlastní GUI — její stav ukazuje diagnostika Zenithu (karta *Rampa*) a GUI pozemní
-stanice. U soukromého repa naklonuj ručně a spusť `tools\windows\rampa_setup.cmd`.
+Doinstaluje Git a Python 3.12 (pokud chybí), stáhne repo jako git klon do složky **`Rampa` na ploše**
+a vytvoří dva zástupce s ikonou rampy:
+
+* **„Rampa diagnostika“** — aktualizuje složku `Rampa` z GitHubu (vlastní úpravy schová do `git stash`)
+  a spustí samostatnou USB diagnostiku rampy ([`gui/rampa_diag.py`](gui/rampa_diag.py), vzhled a ovládání
+  ve stylu diagnostiky Daidalosu a Zenithu). Stačí připojit rampu přímo k PC přes USB — bez nutnosti
+  propojovat ji se Zenithem nebo pozemní stanicí (obsahuje i režim **Simulace** bez hardwaru).
+* **„Rampa firmware“** — aktualizuje složku `Rampa` a otevře [`Rampa_MCU/Rampa_MCU.ino`](Rampa_MCU/Rampa_MCU.ino)
+  v Arduino IDE (dosavadní postup zůstává zachován).
+
+Dosavadní způsoby diagnostiky (přes kartu *Rampa* v diagnostice Zenithu, přes GUI pozemní stanice i
+1 Hz výpis na USB Serial Monitoru 115200 Bd) jsou plně zachovány beze změny. Popis USB příkazů a
+telemetrie je v [`docs/USB_PROTOCOL.md`](docs/USB_PROTOCOL.md). U soukromého repa naklonuj ručně a
+spusť `tools\windows\rampa_setup.cmd`.
+
+Spuštění diagnostiky ručně (Windows / Linux / macOS):
+
+```bash
+pip install -r gui/requirements.txt
+python3 gui/rampa_diag.py          # nebo s --demo pro simulaci
+```
 
 **Jeden firmware pro obě rakety, bez přenahrávání.** Rampa sama pozná, kdo je na pogu:
 
