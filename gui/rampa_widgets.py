@@ -452,16 +452,17 @@ class PadDiagramWidget(QtWidgets.QWidget):
             p.setPen(QtGui.QPen(QtGui.QColor(C["accent"]), 1.2))
             p.drawLine(QtCore.QPointF(tx, bar.top() - 2), QtCore.QPointF(tx, bar.bottom() + 2))
 
-        # 4. Pogo Umbilical J3
+        # 4. Pogo Umbilical J3 + J14
         umb_col = DIM if not online else (BAD if umb_trip else (GOOD if proto != 0 else C["cyan"]))
-        proto_short = {0: "Hledá raketu", 1: "Zenith (UART)", 2: "Daidalos (I²C)"}.get(proto, "?")
+        proto_short = {0: "Hledá (J3+J14)", 1: "Zenith (UART)", 2: "Daidalos (I²C)"}.get(proto, "?")
+        conn_short = {0: "J3 + J14", 1: "J3 (GP0/1)", 2: "J14 (GP8/9)"}.get(s.get("conn", 0), "?")
         umb_lines = [
             f"Raketa: {proto_short}" if online else "Raketa: —",
-            f"UMB_5V: {'ZAP' if umb_on else 'VYP'} ({umb_ma} mA)" if online else "UMB_5V: —",
-            f"Nadproud: {'ODPOJENO!' if umb_trip else 'OK'}" if online else "Nadproud: —",
+            f"Konektor: {conn_short}" if online else "Konektor: —",
+            f"UMB_5V: {'ZAP' if umb_on else 'VYP'} ({umb_ma} mA)" + (" !" if umb_trip else "") if online else "UMB_5V: —",
         ]
         r_umb = QtCore.QRectF(mx * 3 + col_w * 2, my, col_w, row_h)
-        self._box(p, r_umb, "POGO UMBILICAL (J3)", umb_lines, umb_col)
+        self._box(p, r_umb, "POGO UMBILICAL (J3 · J14)", umb_lines, umb_col)
 
         # 5. LoRa & Annunciators
         lora_col = DIM if not online else (GOOD if lora_on else C["muted"])

@@ -12,6 +12,7 @@ uint32_t g_ms = 0;
 int g_pin[32];
 StubPrint Serial;
 StubUart Serial1;
+StubUart Serial2;
 TwoWire Wire(false), Wire1(true);
 StubSPI SPI1;
 StubLoRa LoRa;
@@ -57,21 +58,25 @@ static void reset_rampa()
 {
     memset(g_pin, 0, sizeof g_pin);
     g_ms += 100000; g_tca_out = 0; g_key = true; g_btn = false; g_vbat_mv = 8000; g_cont_mv = 1200;
-    s_proto = P_NONE; s_port = PORT_OFF; s_state = ZR_ST_IDLE; s_latched = 0; s_cd = false; s_detached = false;
+    s_proto = P_NONE; s_conn = CONN_NONE; s_port = PORT_OFF; s_i2c_conn = CONN_NONE;
+    s_uart1_on = false; s_uart2_on = false;
+    s_state = ZR_ST_IDLE; s_latched = 0; s_cd = false; s_detached = false;
     s_fired_ms = 0; s_fire_end_ms = 0; s_detach_req = false; s_last_cmd_ms = 0; s_lora_on = false; s_lora_ok = false;
     s_lora_tx_cnt = 0; s_lora_rx_cnt = 0; s_lora_beacon_now = false; s_usb_stream = false; s_locate = false;
     s_rocket_pwr = true; s_umb_trip = false; s_diag_buzz_end = 0; diag_exit(true);
     Serial.rx.clear(); Serial.tx.clear();
-    Wire.slave_on = false; Serial1.on = false; Serial1.rx.clear(); Serial1.tx.clear();
+    Wire.slave_on = false; Wire.sda = -1; Wire.scl = -1;
+    Serial1.on = false; Serial1.rx.clear(); Serial1.tx.clear();
+    Serial2.on = false; Serial2.rx.clear(); Serial2.tx.clear();
     setup();
 }
 
 // ---------------------------------------------------------------- Ariadna (Daidalos)
 static uint8_t a_seq = 0;
-/** One Ariadna Navigation-MCU transaction: write the 16 B command, read 20 B. Returns 0 = NACK. */
-static int ariadna_xfer(uint8_t cmd, int32_t t_rem, ariadna_rampa_status_t *out)
+/** One Ariadna Navigation-MCU transaction on a specific SDA pin (0 = J3, 8 = J14). Returns 0 = NACK. */
+static int ariadna_xfer_on(int want_sda, uint8_t cmd, int32_t t_rem, ariadna_rampa_status_t *out)
 {
-    if (!Wire.slave_on) return 0;                         // nobody ACKs address 0x2B
+    if (!Wire.slave_on || Wire.sda != want_sda) return 0; // nobody ACKs 0x2B on this connector
     ariadna_rampa_cmd_t c; memset(&c, 0, sizeof c);
     c.cmd = cmd; c.seq = ++a_seq; c.t_rem_ms = t_rem; c.utc_ms = 0xFFFFFFFFu; c.pyro_ch = 2;
     c.rocket_flags = ARIADNA_RK_POST_OK | ARIADNA_RK_NAV_VALID | ARIADNA_RK_POS_OK | ARIADNA_RK_NAV_OK |
@@ -85,44 +90,55 @@ static int ariadna_xfer(uint8_t cmd, int32_t t_rem, ariadna_rampa_status_t *out)
     return ariadna_rampa_status_decode(Wire.stx.data(), Wire.stx.size(), out) == ARIADNA_RAMPA_OK ? 1 : 0;
 }
 
-static void test_ariadna()
+static int ariadna_xfer(uint8_t cmd, int32_t t_rem, ariadna_rampa_status_t *out)
 {
-    printf("== Daidalos / Ariadna V2 on the pogo (I2C slave 0x2B)\n");
+    return ariadna_xfer_on(PIN_UMB2_0, cmd, t_rem, out);
+}
+
+static void test_ariadna_on(const char *label, int sda_pin, uint8_t expect_conn)
+{
+    printf("== Daidalos / Ariadna V2 on %s (I2C slave 0x2B, GP%d/GP%d)\n", label, sda_pin, sda_pin + 1);
     reset_rampa();
     ariadna_rampa_status_t st{};
     int ok = 0;
-    for (int i = 0; i < 40; i++) { ok = ariadna_xfer(RAMPA_CMD_PING, -1, &st); run_ms(50); }   // 2 s of 20 Hz pings
-    CHECK(ok && s_proto == P_ARIADNA, "recognised as Ariadna");
-    CHECK(!(g_tca_out & 0x02), "UMB_5V stays OFF for an Ariadna");
+    for (int i = 0; i < 40; i++) { ok = ariadna_xfer_on(sda_pin, RAMPA_CMD_PING, -1, &st); run_ms(50); }   // 2 s of 20 Hz pings
+    CHECK(ok && s_proto == P_ARIADNA && s_conn == expect_conn, "recognised as Ariadna on %s", label);
+    CHECK(!(g_tca_out & 0x02), "UMB_5V stays OFF for an Ariadna on %s", label);
     CHECK(st.state == RAMPA_STATE_IDLE && (st.flags & ARIADNA_RMP_LORA_OFF), "IDLE, LoRa off (state %u flags %02X)", st.state, st.flags);
-    for (int i = 0; i < 10; i++) { ariadna_xfer(RAMPA_CMD_PREPARE, -1, &st); run_ms(50); }
+    for (int i = 0; i < 10; i++) { ariadna_xfer_on(sda_pin, RAMPA_CMD_PREPARE, -1, &st); run_ms(50); }
     CHECK(st.state == RAMPA_STATE_READY && (st.flags & ARIADNA_RMP_READY), "PREPARE -> READY");
     const uint32_t t0 = g_ms + 10000;
     bool committed_same_xfer = false;
-    while ((int32_t)(t0 - g_ms) > 100) { ariadna_xfer(RAMPA_CMD_COUNTDOWN, (int32_t)(t0 - g_ms), &st); run_ms(50); }
+    while ((int32_t)(t0 - g_ms) > 100) { ariadna_xfer_on(sda_pin, RAMPA_CMD_COUNTDOWN, (int32_t)(t0 - g_ms), &st); run_ms(50); }
     CHECK(st.state == RAMPA_STATE_COUNTDOWN, "COUNTDOWN running (T-%ld)", (long)st.t_rem_ms);
     // Ariadna's T-100 ms commit: the answer must be COMMITTED in the same transaction
-    ariadna_xfer(RAMPA_CMD_COMMIT, (int32_t)(t0 - g_ms), &st);
+    ariadna_xfer_on(sda_pin, RAMPA_CMD_COMMIT, (int32_t)(t0 - g_ms), &st);
     committed_same_xfer = st.state == RAMPA_STATE_COMMITTED && (st.flags & ARIADNA_RMP_DETACHING);
     CHECK(committed_same_xfer, "COMMITTED returned in the same I2C transaction (state %u)", st.state);
     run_ms(5);
-    CHECK(!Wire.slave_on && s_detached, "umbilical detached (Hi-Z) before T-0");
+    CHECK(!Wire.slave_on && s_detached, "umbilical %s detached (Hi-Z) before T-0", label);
     bool fired = false;
     while ((int32_t)(g_ms - t0) < 50) { run_ms(1); if (g_pin[17] && g_pin[19]) fired = true; }
     CHECK(fired, "motor igniter (channel 2 from the command) fired at T-0");
     run_ms(1200);
     CHECK(!g_pin[17] && !g_pin[19], "firing pulse ended (1 s)");
-    run_ms(7000);
-    CHECK(Wire.slave_on, "umbilical re-attached after the launch window");
+    run_ms(4500);
+    CHECK(Wire.slave_on && Wire.sda == sda_pin, "umbilical %s re-attached after the launch window", label);
     // abort path: button
-    for (int i = 0; i < 10; i++) { ariadna_xfer(RAMPA_CMD_PREPARE, -1, &st); run_ms(50); }
+    for (int i = 0; i < 10; i++) { ariadna_xfer_on(sda_pin, RAMPA_CMD_PREPARE, -1, &st); run_ms(50); }
     const uint32_t t1 = g_ms + 15000;
-    for (int i = 0; i < 20; i++) { ariadna_xfer(RAMPA_CMD_COUNTDOWN, (int32_t)(t1 - g_ms), &st); run_ms(50); }
+    for (int i = 0; i < 20; i++) { ariadna_xfer_on(sda_pin, RAMPA_CMD_COUNTDOWN, (int32_t)(t1 - g_ms), &st); run_ms(50); }
     g_btn = true; run_ms(60); g_btn = false;
-    ariadna_xfer(RAMPA_CMD_COUNTDOWN, (int32_t)(t1 - g_ms), &st);
+    ariadna_xfer_on(sda_pin, RAMPA_CMD_COUNTDOWN, (int32_t)(t1 - g_ms), &st);
     CHECK(st.state == RAMPA_STATE_ABORT && (st.fault_mask & ARIADNA_RMPF_BTN_ABORT), "local abort button -> ABORT");
     run_ms(20000);
     CHECK(!g_pin[16] && !g_pin[17] && !g_pin[18] && !g_pin[19], "nothing fired after the abort");
+}
+
+static void test_ariadna()
+{
+    test_ariadna_on("J14", PIN_UMB2_0, CONN_J14);
+    test_ariadna_on("J3",  PIN_UMB1_0, CONN_J3);
 }
 
 // ---------------------------------------------------------------- Zenith
@@ -131,32 +147,56 @@ static zl_rx_t z_rx;
 static zl_rmp_status_t z_st;
 static int z_got = 0;
 
-static void zenith_send(uint8_t cmd, int32_t t_rem, uint8_t flags = ZL_RK_GO | ZL_RK_NAV_OK)
+static void zenith_send_on(StubUart &ser, uint8_t cmd, int32_t t_rem, uint8_t flags = ZL_RK_GO | ZL_RK_NAV_OK)
 {
     zl_rmp_cmd_t c{}; c.cmd = cmd; c.seq = ++z_seq; c.t_rem_ms = t_rem; c.rocket_flags = flags; c.pyro_ch = 1; c.fire_ms = 800;
     uint8_t f[ZL_FRAME_MAX]; uint16_t n = zl_encode(f, ZL_PKT_RMP_CMD, &c, sizeof c);
-    if (Serial1.on) Serial1.rx.insert(Serial1.rx.end(), f, f + n);   // bytes on a closed UART are lost
+    if (ser.on) ser.rx.insert(ser.rx.end(), f, f + n);   // bytes on a closed UART are lost
 }
-static void zenith_rx()
+static void zenith_rx_on(StubUart &ser)
 {
-    for (uint8_t b : Serial1.tx) {
+    for (uint8_t b : ser.tx) {
         const uint8_t *pl; uint8_t n;
         if (zl_rx_byte(&z_rx, b, &pl, &n) == ZL_PKT_RMP_STATUS && zl_take(&z_st, sizeof z_st, pl, n)) z_got++;
     }
-    Serial1.tx.clear();
+    ser.tx.clear();
 }
-static void zenith_tick(uint8_t cmd, int32_t t_rem) { zenith_send(cmd, t_rem); run_ms(50); zenith_rx(); }
+static void zenith_tick_on(StubUart &ser, uint8_t cmd, int32_t t_rem) { zenith_send_on(ser, cmd, t_rem); run_ms(50); zenith_rx_on(ser); }
+static void zenith_send(uint8_t cmd, int32_t t_rem, uint8_t flags = ZL_RK_GO | ZL_RK_NAV_OK) { zenith_send_on(Serial1, cmd, t_rem, flags); }
+static void zenith_rx() { zenith_rx_on(Serial1); }
+static void zenith_tick(uint8_t cmd, int32_t t_rem) { zenith_tick_on(Serial1, cmd, t_rem); }
+
+static void test_zenith_on_j14()
+{
+    printf("== Zenith on J14 (UART1 Serial2, GP8/GP9)\n");
+    reset_rampa(); zl_rx_init(&z_rx); z_got = 0;
+    run_ms(1700);
+    CHECK(g_tca_out & 0x02, "UMB_5V on after 1.5 s boot listen");
+    for (int i = 0; i < 60; i++) zenith_tick_on(Serial2, ZR_CMD_PING, -1);
+    CHECK(s_proto == P_ZENITH && s_conn == CONN_J14 && z_got > 10, "recognised as Zenith on J14 (%d answers)", z_got);
+    for (int i = 0; i < 10; i++) zenith_tick_on(Serial2, ZR_CMD_PREPARE, -1);
+    CHECK(z_st.state == ZR_ST_READY, "J14 PREPARE -> READY");
+    const uint32_t t0 = g_ms + 12000;
+    while ((int32_t)(t0 - g_ms) > 300) zenith_tick_on(Serial2, ZR_CMD_COUNTDOWN, (int32_t)(t0 - g_ms));
+    zenith_tick_on(Serial2, ZR_CMD_COMMIT, (int32_t)(t0 - g_ms));
+    CHECK(z_st.state == ZR_ST_COMMITTED, "J14 COMMITTED");
+    bool fired = false;
+    while ((int32_t)(g_ms - t0) < 100) { run_ms(1); if (g_pin[16] && g_pin[19]) fired = true; }
+    CHECK(fired, "J14 igniter fired at T-0");
+    run_ms(900);
+    CHECK(!g_pin[16] && !g_pin[19], "J14 firing pulse ended");
+}
 
 static void test_zenith()
 {
-    printf("== Zenith on the pogo (UART 115200)\n");
+    printf("== Zenith on J3 (UART0 Serial1, GP0/GP1)\n");
     reset_rampa(); zl_rx_init(&z_rx); z_got = 0;
     run_ms(1400);
     CHECK(!(g_tca_out & 0x02), "UMB_5V off during the first 1.5 s (looking for an Ariadna)");
     run_ms(300);
     CHECK(g_tca_out & 0x02, "then UMB_5V on (powers a Zenith with its battery off)");
     for (int i = 0; i < 60; i++) zenith_tick(ZR_CMD_PING, -1);   // Zenith boots and pings at 20 Hz
-    CHECK(s_proto == P_ZENITH && z_got > 10, "recognised as Zenith (%d answers)", z_got);
+    CHECK(s_proto == P_ZENITH && s_conn == CONN_J3 && z_got > 10, "recognised as Zenith on J3 (%d answers)", z_got);
     CHECK(z_st.state == ZR_ST_IDLE && (z_st.flags & ZL_RMP_ROCKET_PWR), "IDLE, rocket powered");
     for (int i = 0; i < 10; i++) zenith_tick(ZR_CMD_PREPARE, -1);
     CHECK(z_st.state == ZR_ST_READY, "PREPARE -> READY");
@@ -283,6 +323,7 @@ int main()
 {
     test_ariadna();
     test_zenith();
+    test_zenith_on_j14();
     test_usb_diag();
     printf("\n%s (%d failures)\n", g_fail ? "RAMPA TEST FAILED" : "RAMPA TEST PASSED", g_fail);
     return g_fail ? 1 : 0;

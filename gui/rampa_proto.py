@@ -23,10 +23,20 @@ PROTO_NAMES = {
     2: "Daidalos / Ariadna V2 (I²C 0x2B)",
 }
 
+CONN_NAMES = {
+    0: "Hledá (J3 + J14)",
+    1: "J3 (GP0/GP1)",
+    2: "J14 (GP8/GP9)",
+}
+
 PORT_NAMES = {
     0: "Odpojeno (Hi-Z)",
-    1: "UART0 (GP0 TX / GP1 RX)",
-    2: "I²C0 slave 0x2B (GP0 SDA / GP1 SCL)",
+    1: "J3 · UART0 (GP0 TX / GP1 RX)",
+    2: "J3 · I²C0 0x2B (GP0 SDA / GP1 SCL)",
+    3: "J14 · UART1 (GP8 TX / GP9 RX)",
+    4: "J14 · I²C0 0x2B (GP8 SDA / GP9 SCL)",
+    5: "Scan A: J3 UART0 + J14 I²C0",
+    6: "Scan B: J3 I²C0 + J14 UART1",
 }
 
 RAMPA_STATES = {
@@ -103,9 +113,10 @@ _LEGACY_RE = re.compile(
     r"^RAMPA\s+(scan|ZENITH|ARIADNA)\s+port\s+(\d+)\s+st\s+(\d+)\s+"
     r"flags\s+0x([0-9A-Fa-f]+)\s+faults\s+0x([0-9A-Fa-f]+)\s+"
     r"vbat\s+(\d+)\s+umb\s+(\d+)\s+mA\s+cont\s+(\d+)/(\d+)/(\d+)\s+"
-    r"key\s+(\d+)\s+btn\s+(\d+)\s+lora\s+(\d+)"
+    r"key\s+(\d+)\s+btn\s+(\d+)\s+lora\s+(\d+)(?:\s+conn\s+(scan|J3|J14))?"
 )
 _PROTO_STR_TO_ID = {"scan": 0, "ZENITH": 1, "ARIADNA": 2}
+_CONN_STR_TO_ID = {"scan": 0, "J3": 1, "J14": 2}
 
 
 def to_int(val, default: int = 0) -> int:
@@ -123,6 +134,11 @@ def parse_status_line(line: str) -> dict | None:
     if len(parts) < len(S_FIELDS):
         return None
     d = {k: to_int(parts[i]) for i, k in enumerate(S_FIELDS)}
+    if len(parts) > len(S_FIELDS):
+        d["conn"] = to_int(parts[len(S_FIELDS)])
+    else:
+        p = d["port"]
+        d["conn"] = 1 if p in (1, 2) and d["proto"] else (2 if p in (3, 4) and d["proto"] else 0)
     d["legacy"] = 0
     return d
 
@@ -141,6 +157,8 @@ def parse_legacy_line(line: str) -> dict | None:
     key = int(m.group(11))
     btn = int(m.group(12))
     lora_on = int(m.group(13))
+    conn_tok = m.group(14)
+    conn = _CONN_STR_TO_ID.get(conn_tok, 1 if proto else 0) if conn_tok else (1 if proto else 0)
     hw_ok = 0 if (faults & (1 << 5)) else 0x0F
     if lora_on:
         hw_ok |= 0x10
@@ -148,6 +166,7 @@ def parse_legacy_line(line: str) -> dict | None:
         "t_ms": 0,
         "proto": proto,
         "port": int(m.group(2)),
+        "conn": conn,
         "state": int(m.group(3)),
         "flags": flags,
         "faults": faults,
@@ -282,7 +301,8 @@ class RampaSimCore:
         self.t0 = time.monotonic()
         self.stream = False
         self.proto = 0
-        self.port = 2
+        self.conn = 0
+        self.port = 5
         self.state = 1  # IDLE
         self.key = True
         self.btn = False
@@ -360,7 +380,7 @@ class RampaSimCore:
             self._last_beacon = now
             self.lora_tx += 1
         if self.proto == 0:
-            self.port = 1 if (int(t / 0.6) % 2) else 2
+            self.port = 6 if (int(t / 0.6) % 2) else 5
         flags, faults = self._flags_and_faults()
         hw_mask = 0x1F if self.lora_ok else 0x0F
         fire_mask = (1 << (self.diag_fire_ch - 1)) if self.diag_fire_ch else 0
@@ -380,7 +400,7 @@ class RampaSimCore:
             int(self.key), int(self.btn), int(self.diag_arm), fire_mask,
             int(self.lora_on), int(self.rocket_pwr), int(self.umb_trip), int(self.locate),
             int(self.diag), int(self.diag_arm), -1, self.pyro_ch, self.fire_ms,
-            0, -1, exp_in, exp_out, self.lora_tx, self.lora_rx,
+            0, -1, exp_in, exp_out, self.lora_tx, self.lora_rx, self.conn,
         ]
         return "$S," + ",".join(str(v) for v in vals)
 

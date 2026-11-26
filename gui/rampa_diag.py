@@ -234,11 +234,11 @@ class RampaDiagWindow(QtWidgets.QMainWindow):
         c_pwr.lay.addStretch(1)
         g.addWidget(c_pwr, 0, 0)
 
-        c_umb = Card("Pogo J3 · 433 MHz", "Umbilical a LoRa")
+        c_umb = Card("Pogo J3 + J14 · 433 MHz", "Umbilical a LoRa")
         self.umb_kv = KV([
-            "Rozpoznaná raketa", "Port GP0 / GP1", "Napájení rakety UMB_5V",
+            "Rozpoznaná raketa", "Aktivní konektor", "Režim portů", "Napájení rakety UMB_5V",
             "Odpočet T−", "Zvolený kanál / pulz", "Poslední seq / stáří",
-            "LoRa Ra-02 (433 MHz)", "LoRa TX beaconů", "LoRa RX uplinků", "Lokátor bzučák",
+            "LoRa Ra-02 (433 MHz)", "LoRa TX / RX", "Lokátor bzučák",
         ])
         c_umb.lay.addWidget(self.umb_kv)
         c_umb.lay.addStretch(1)
@@ -430,9 +430,9 @@ class RampaDiagWindow(QtWidgets.QMainWindow):
             row.addStretch(1)
             pw.lay.addLayout(row)
 
-        add_group("Napájení rakety UMB_5V (TCA9534 P1 · buck U2)", [
-            ("UMB_5V ZAP", "ROCKETPWR 1", "Povolí 5V napájení rakety (pro Daidalos zůstane vypnuté)", False),
-            ("UMB_5V VYP", "ROCKETPWR 0", "Vypne napájení rakety na pogu J3.2", False),
+        add_group("Napájení rakety UMB_5V (TCA9534 P1 · buck U2 · J3.2 + J14.2)", [
+            ("UMB_5V ZAP", "ROCKETPWR 1", "Povolí 5V napájení rakety na J3.2 + J14.2 (pro Daidalos zůstane vypnuté)", False),
+            ("UMB_5V VYP", "ROCKETPWR 0", "Vypne napájení rakety na J3.2 + J14.2", False),
         ])
         add_group("Bzučák (TCA9534 P0)", [
             ("Pípnout 300 ms", "BUZZ 300", "", False),
@@ -766,7 +766,9 @@ class RampaDiagWindow(QtWidgets.QMainWindow):
             self.chip_board.set("ok", f"Online · {self.port_name}")
 
         if fresh:
-            p_short = {0: "Hledá raketu", 1: "Zenith UART", 2: "Daidalos I²C"}.get(proto, "?")
+            conn = s.get("conn", 0)
+            c_tag = {1: " · J3", 2: " · J14"}.get(conn, "")
+            p_short = {0: "Hledá (J3+J14)", 1: f"Zenith UART{c_tag}", 2: f"Daidalos I²C{c_tag}"}.get(proto, "?")
             self.chip_proto.set("ok" if proto != 0 else "warn", p_short)
             self.chip_key.set("ok" if key else "warn", "Klíč J4: SEPNUT" if key else "Klíč J4: SAFE")
             if s.get("fire_mask"):
@@ -827,8 +829,10 @@ class RampaDiagWindow(QtWidgets.QMainWindow):
             self.pwr_kv.set("Nadproud UMB_5V", "ODPOJENO (> 2,5 A)" if s["umb_trip"] else "OK", BAD if s["umb_trip"] else GOOD)
             self.pwr_kv.set("Čas běhu", f"{vs.cz(s['t_ms'] / 1000.0, 1)} s" if s["t_ms"] > 0 else "—")
 
+            conn = s.get("conn", 0)
             self.umb_kv.set("Rozpoznaná raketa", rp.PROTO_NAMES.get(proto, str(proto)), GOOD if proto else WARN)
-            self.umb_kv.set("Port GP0 / GP1", rp.PORT_NAMES.get(s["port"], str(s["port"])))
+            self.umb_kv.set("Aktivní konektor", rp.CONN_NAMES.get(conn, str(conn)), GOOD if conn else WARN)
+            self.umb_kv.set("Režim portů", rp.PORT_NAMES.get(s["port"], str(s["port"])))
             umb_out = bool(flags & (1 << 6))
             self.umb_kv.set("Napájení rakety UMB_5V", "ZAPNUTO" if umb_out else "VYPNUTO", GOOD if umb_out else DIM)
             self.umb_kv.set("Odpočet T−", f"T−{vs.cz(s['t_rem_ms'] / 1000.0, 2)} s" if s["t_rem_ms"] >= 0 else "—")
@@ -836,8 +840,7 @@ class RampaDiagWindow(QtWidgets.QMainWindow):
             age_txt = f"{s['cmd_age_ms']} ms" if s["cmd_age_ms"] >= 0 else "—"
             self.umb_kv.set("Poslední seq / stáří", f"#{s['last_seq']} / {age_txt}")
             self.umb_kv.set("LoRa Ra-02 (433 MHz)", "ZAPNUTO (beacon)" if s["lora_on"] else "VYPNUTO", GOOD if s["lora_on"] else DIM)
-            self.umb_kv.set("LoRa TX beaconů", str(s["lora_tx"]))
-            self.umb_kv.set("LoRa RX uplinků", str(s["lora_rx"]))
+            self.umb_kv.set("LoRa TX / RX", f"{s['lora_tx']} / {s['lora_rx']}")
             self.umb_kv.set("Lokátor bzučák", "ZAP" if s["locate"] else "vyp", WARN if s["locate"] else DIM)
 
             self.safe_kv.set("Klíč J4 (RBF)", "SEPNUT (ARMED)" if key else "VYPNUT (SAFE)", GOOD if key else WARN)

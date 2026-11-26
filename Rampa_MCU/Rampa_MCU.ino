@@ -2,12 +2,15 @@
 //  RAMPA PCB1 — launch pad controller for ZENITH *and* DAIDALOS (Ariadna V2)
 //
 //  ONE firmware, no reflashing: the rampa recognises by itself which rocket
-//  is on the pogo umbilical and speaks its protocol.
+//  is on either pogo umbilical connector (J3 on GP0/GP1 or J14 on GP8/GP9)
+//  and speaks its protocol.
 //
-//    Zenith  (zenith_link.h)        UART0 115200 on GP0 (TX) / GP1 (RX),
+//    Zenith  (zenith_link.h)        UART0 (J3: GP0 TX / GP1 RX) or
+//                                   UART1 (J14: GP8 TX / GP9 RX) @ 115200,
 //                                   rocket = master, 20 Hz command/status frames,
 //                                   rampa powers the rocket over UMB_5V.
-//    Ariadna (ariadna_rampa_link.h) I2C0 slave 0x2B on GP0 (SDA) / GP1 (SCL),
+//    Ariadna (ariadna_rampa_link.h) I2C0 slave 0x2B on J14 (GP8 SDA / GP9 SCL,
+//                                   4.7 kOhm pull-ups) or J3 (GP0 SDA / GP1 SCL),
 //                                   Navigation MCU = I2C master @ 100 kHz, 20 Hz,
 //                                   UMB_5V stays OFF (the Ariadna harness leaves
 //                                   pin 2 unconnected), hot-detach at COMMIT —
@@ -18,21 +21,22 @@
 //  Needs : LoRa (sandeepmistry), Adafruit NeoPixel.
 //
 //  ---------------------------------------------------------------------
-//  HOW THE ROCKET IS RECOGNISED
+//  HOW THE ROCKET AND CONNECTOR ARE RECOGNISED
 //  ---------------------------------------------------------------------
-//  GP0/GP1 can be UART0 or I2C0 on the RP2350, and both rockets use the
-//  same pogo pins (J3.3 / J3.4). While nobody is locked in, the rampa
-//  listens alternately 600 ms as an I2C slave and 600 ms as a UART. The
-//  first frame that passes its protocol's magic + CRC locks that protocol;
+//  Both J3 (GP0/GP1) and J14 (GP8/GP9) carry the same 4-pin umbilical pinout
+//  (1 GND, 2 UMB_5V, 3 RX/SCL, 4 TX/SDA). While nobody is locked in, the rampa
+//  alternates every 600 ms between:
+//    Slot A: J3 = UART0 (Serial1) + J14 = I2C0 slave 0x2B (Wire)
+//    Slot B: J3 = I2C0 slave 0x2B + J14 = UART1 (Serial2)
+//  The first frame that passes its protocol's magic + CRC locks both the
+//  protocol and the connector (J3 or J14) without disturbing the active bus;
 //  it stays locked while frames keep coming (and always through a countdown
-//  and firing). Neither protocol can be mistaken for the other: a UART byte
-//  stream never produces an I2C START (SDA is not driven by the rocket in
-//  UART mode), and I2C traffic seen by the UART is framing garbage that
-//  fails the 0x5A 0xE7 sync + CRC-16.
+//  and firing).
 //
-//  At power-up the rampa first listens 1.5 s as an I2C slave with the
-//  rocket supply OFF. Only if no Ariadna answers does it switch UMB_5V on
-//  (a Zenith with its battery switched off needs it to boot).
+//  At power-up the rampa first listens 1.5 s with UMB_5V OFF (750 ms Slot A
+//  for Ariadna on J14, then 750 ms Slot B for Ariadna on J3). Only if no
+//  Ariadna answers does it switch UMB_5V on (a Zenith with its battery
+//  switched off needs it to boot).
 //
 //  Ariadna expects the COMMITTED answer in the SAME I2C transaction as its
 //  COMMIT write (25 ms timeout), so Ariadna commands are processed directly
@@ -49,12 +53,14 @@
 #include "ariadna_rampa_link.h"
 
 // =====================================================================
-//  1. PINOUT (RampaNetlist_PCB1_2026-11-19.enet)
+//  1. PINOUT (hardware/RampaPCBnet.enet)
 // =====================================================================
-static const uint8_t PIN_UMB_0      = 0;   // U7.1  -> R21 1k   -> J3.4   (UART0 TX | I2C0 SDA)
-static const uint8_t PIN_UMB_1      = 1;   // U7.2  <- R22 100R <- J3.3   (UART0 RX | I2C0 SCL), R23 100k PU
+static const uint8_t PIN_UMB1_0     = 0;   // U7.1  -> R21 1k   -> J3.4   (UART0 TX | I2C0 SDA)
+static const uint8_t PIN_UMB1_1     = 1;   // U7.2  <- R22 100R <- J3.3   (UART0 RX | I2C0 SCL), R23 100k PU
 static const uint8_t PIN_INT_SDA    = 6;   // I2C1 internal bus (R18 4.7k)
 static const uint8_t PIN_INT_SCL    = 7;   //                   (R19 4.7k)
+static const uint8_t PIN_UMB2_0     = 8;   // U7.11 -> R9  100R -> J14.4  (UART1 TX | I2C0 SDA), R76 4.7k PU
+static const uint8_t PIN_UMB2_1     = 9;   // U7.12 <- R10 100R <- J14.3  (UART1 RX | I2C0 SCL), R35 4.7k PU
 static const uint8_t PIN_LORA_SCK   = 10;  // SPI1 -> M1 Ra-02 (via 1k)
 static const uint8_t PIN_LORA_MOSI  = 11;
 static const uint8_t PIN_LORA_MISO  = 12;
@@ -69,7 +75,7 @@ static const uint8_t ADDR_INA_UMB   = 0x41;
 static const uint8_t ADDR_ADS       = 0x48;
 
 static const uint8_t EXP_BUZZER     = 1u << 0;  // OUT H = buzzer
-static const uint8_t EXP_ROCKET_EN  = 1u << 1;  // OUT H = UMB_5V buck on (rocket power)
+static const uint8_t EXP_ROCKET_EN  = 1u << 1;  // OUT H = UMB_5V buck on (rocket power, J3.2 + J14.2)
 static const uint8_t EXP_KEY        = 1u << 2;  // IN  H = key switch J4 closed
 static const uint8_t EXP_LORA_RST   = 1u << 3;  // OUT L = LoRa reset
 static const uint8_t EXP_LORA_EN    = 1u << 4;  // OUT H = LoRa 3V3 on (U12)
@@ -86,22 +92,35 @@ static const uint32_t POST_FIRE_MS     = 5000;   // FIRED -> IDLE (as Daidalos R
 static const uint16_t ARIADNA_FIRE_MS  = 1000;   // Daidalos RAMPA_FIRE_PULSE_MS
 static const uint32_t LINK_TIMEOUT_MS  = 1500;   // both protocols
 static const uint32_t UNLOCK_MS        = 3000;   // forget the protocol after this much silence
-static const uint32_t SCAN_SLOT_MS     = 600;    // alternate I2C / UART listening
-static const uint32_t BOOT_I2C_MS      = 1500;   // first listen for Ariadna with UMB_5V off
+static const uint32_t SCAN_SLOT_MS     = 600;    // alternate J3/J14 I2C / UART listening
+static const uint32_t BOOT_I2C_MS      = 1500;   // first listen for Ariadna on J14 + J3 with UMB_5V off
 static const uint16_t UMB_OVERCURRENT  = 2500;   // mA on UMB_5V -> switch it off
 static const uint32_t RADIO_QUIET_AFTER_FIRE_MS = 30UL * 60UL * 1000UL;
 
 enum Proto : uint8_t { P_NONE = 0, P_ZENITH = 1, P_ARIADNA = 2 };
-enum Port  : uint8_t { PORT_OFF = 0, PORT_UART = 1, PORT_I2C = 2 };
+enum Conn  : uint8_t { CONN_NONE = 0, CONN_J3 = 1, CONN_J14 = 2 };
+enum Port  : uint8_t {
+    PORT_OFF      = 0,
+    PORT_J3_UART  = 1,   // J3  (GP0/GP1) UART0 (Serial1)
+    PORT_J3_I2C   = 2,   // J3  (GP0/GP1) I2C0  (Wire)
+    PORT_J14_UART = 3,   // J14 (GP8/GP9) UART1 (Serial2)
+    PORT_J14_I2C  = 4,   // J14 (GP8/GP9) I2C0  (Wire)
+    PORT_SCAN_A   = 5,   // J3=UART0 + J14=I2C0
+    PORT_SCAN_B   = 6    // J3=I2C0  + J14=UART1
+};
 
 // =====================================================================
 //  3. STATE  (volatile: touched by the I2C slave interrupt too)
 // =====================================================================
 static Adafruit_NeoPixel s_rgb(1, PIN_RGB, NEO_GRB + NEO_KHZ800);
-static zl_rx_t  s_rx;
+static zl_rx_t  s_rx1, s_rx2;
 
 static volatile uint8_t  s_proto = P_NONE;
+static volatile uint8_t  s_conn = CONN_NONE;       // locked umbilical connector (J3 or J14)
 static volatile uint8_t  s_port = PORT_OFF;
+static volatile uint8_t  s_i2c_conn = CONN_NONE;   // connector currently owned by I2C0 (Wire)
+static bool              s_uart1_on = false;       // Serial1 on J3 (GP0/GP1)
+static bool              s_uart2_on = false;       // Serial2 on J14 (GP8/GP9)
 static volatile uint8_t  s_state = ZR_ST_IDLE;     // numerically identical to RAMPA_STATE_*
 static volatile uint8_t  s_faults = 0;             // live interlock faults (same bits in both protocols)
 static volatile uint8_t  s_latched = 0;            // faults that caused an ABORT
@@ -114,7 +133,7 @@ static volatile uint32_t s_last_cmd_ms = 0;
 static volatile bool     s_cd = false;
 static volatile uint32_t s_t0_ms = 0;
 static volatile uint32_t s_fire_end_ms = 0, s_fired_ms = 0;
-static volatile bool     s_detach_req = false;     // Ariadna: float GP0/GP1 after the COMMITTED read
+static volatile bool     s_detach_req = false;     // Ariadna: float active umbilical pins after COMMITTED read
 static volatile uint32_t s_evt = 0;                // events to print from the main loop
 
 static uint8_t  s_exp_out = 0, s_exp_in = 0;
@@ -393,7 +412,8 @@ static void on_i2c_receive(int n)
     ariadna_rampa_cmd_t c;
     if (got != sizeof buf || ariadna_rampa_cmd_decode(buf, got, &c) != ARIADNA_RAMPA_OK) return;
     const uint32_t now = millis();
-    if (s_proto != P_ARIADNA) { s_proto = P_ARIADNA; s_evt |= EVT_LOCK_A; }
+    const uint8_t conn = s_i2c_conn ? s_i2c_conn : CONN_J14;
+    if (s_proto != P_ARIADNA || s_conn != conn) { s_proto = P_ARIADNA; s_conn = conn; s_evt |= EVT_LOCK_A; }
     const uint8_t need = ARIADNA_RK_POST_OK | ARIADNA_RK_NAV_VALID | ARIADNA_RK_POS_OK |
                          ARIADNA_RK_NAV_OK | ARIADNA_RK_NO_ABORT;
     const bool go = (c.rocket_flags & need) == need;
@@ -410,9 +430,10 @@ static void on_i2c_request(void)
 }
 
 // =====================================================================
-//  7. ZENITH: UART0 115200
+//  7. ZENITH: UART0 (J3, GP0/GP1) and UART1 (J14, GP8/GP9) @ 115200
 // =====================================================================
-static void zenith_send_status(uint32_t now)
+template <typename UartT>
+static void zenith_send_status_on(UartT &ser, uint32_t now)
 {
     zl_rmp_status_t st = {};
     st.t_rem_ms = s_cd ? (int32_t)(s_t0_ms - now) : -1;
@@ -426,55 +447,100 @@ static void zenith_send_status(uint32_t now)
     st.fw = (uint8_t)(ZENITH_FW_VERSION & 0xFF);
     uint8_t f[ZL_FRAME_MAX];
     const uint16_t n = zl_encode(f, ZL_PKT_RMP_STATUS, &st, sizeof st);
-    if (Serial1.availableForWrite() >= (int)n) Serial1.write(f, n);
+    if (ser.availableForWrite() >= (int)n) ser.write(f, n);
 }
 
-static void zenith_poll(void)
+template <typename UartT>
+static void zenith_poll_on(UartT &ser, zl_rx_t &rx, uint8_t conn)
 {
     int budget = 256;
-    while (Serial1.available() && budget-- > 0) {
+    while (ser.available() && budget-- > 0) {
         const uint8_t *pl; uint8_t n;
-        if (zl_rx_byte(&s_rx, (uint8_t)Serial1.read(), &pl, &n) != ZL_PKT_RMP_CMD) continue;
+        if (zl_rx_byte(&rx, (uint8_t)ser.read(), &pl, &n) != ZL_PKT_RMP_CMD) continue;
         zl_rmp_cmd_t c;
         if (!zl_take(&c, sizeof c, pl, n)) continue;
         const uint32_t now = millis();
-        if (s_proto != P_ZENITH) { s_proto = P_ZENITH; s_evt |= EVT_LOCK_Z; }
+        if (s_proto != P_ZENITH || s_conn != conn) { s_proto = P_ZENITH; s_conn = conn; s_evt |= EVT_LOCK_Z; }
         // the frame travelled ~1.7 ms (20 B @ 115200) after the rocket stamped t_rem
         const int32_t t_rem = c.t_rem_ms > 0 ? c.t_rem_ms - 2 : c.t_rem_ms;
         noInterrupts();
         rampa_cmd(P_ZENITH, c.cmd, c.seq, t_rem, (c.rocket_flags & ZL_RK_GO) != 0, c.pyro_ch, c.fire_ms, now);
         interrupts();
-        zenith_send_status(now);
+        zenith_send_status_on(ser, now);
     }
 }
 
+static void zenith_poll(void)
+{
+    if (s_uart1_on) zenith_poll_on(Serial1, s_rx1, CONN_J3);
+    if (s_uart2_on) zenith_poll_on(Serial2, s_rx2, CONN_J14);
+}
+
 // =====================================================================
-//  8. UMBILICAL PORT: who owns GP0/GP1
+//  8. UMBILICAL PORTS: J3 (GP0/GP1) and J14 (GP8/GP9)
 // =====================================================================
+static void port_apply(bool want_u1, bool want_u2, uint8_t want_i2c_conn)
+{
+    // Stop peripherals that are no longer wanted or need to move pins first.
+    if (s_uart1_on && !want_u1) {
+        Serial1.end(); s_uart1_on = false;
+        pinMode(PIN_UMB1_0, INPUT); pinMode(PIN_UMB1_1, INPUT);
+    }
+    if (s_uart2_on && !want_u2) {
+        Serial2.end(); s_uart2_on = false;
+        pinMode(PIN_UMB2_0, INPUT); pinMode(PIN_UMB2_1, INPUT);
+    }
+    if (s_i2c_conn != CONN_NONE && s_i2c_conn != want_i2c_conn) {
+        Wire.end();
+        if (s_i2c_conn == CONN_J3)  { pinMode(PIN_UMB1_0, INPUT); pinMode(PIN_UMB1_1, INPUT); }
+        if (s_i2c_conn == CONN_J14) { pinMode(PIN_UMB2_0, INPUT); pinMode(PIN_UMB2_1, INPUT); }
+        s_i2c_conn = CONN_NONE;
+    }
+    // Start newly requested peripherals without disturbing already-active ones.
+    if (want_u1 && !s_uart1_on) {
+        Serial1.setTX(PIN_UMB1_0); Serial1.setRX(PIN_UMB1_1);
+        Serial1.setFIFOSize(512);
+        Serial1.begin(ZL_UMB_BAUD);
+        zl_rx_init(&s_rx1);
+        s_uart1_on = true;
+    }
+    if (want_u2 && !s_uart2_on) {
+        Serial2.setTX(PIN_UMB2_0); Serial2.setRX(PIN_UMB2_1);
+        Serial2.setFIFOSize(512);
+        Serial2.begin(ZL_UMB_BAUD);
+        zl_rx_init(&s_rx2);
+        s_uart2_on = true;
+    }
+    if (want_i2c_conn != CONN_NONE && s_i2c_conn != want_i2c_conn) {
+        ariadna_refresh_tx(millis());
+        if (want_i2c_conn == CONN_J3) { Wire.setSDA(PIN_UMB1_0); Wire.setSCL(PIN_UMB1_1); }
+        else                          { Wire.setSDA(PIN_UMB2_0); Wire.setSCL(PIN_UMB2_1); }
+        Wire.begin((uint8_t)ARIADNA_RAMPA_I2C_ADDR);
+        Wire.onReceive(on_i2c_receive);
+        Wire.onRequest(on_i2c_request);
+        s_i2c_conn = want_i2c_conn;
+    }
+}
+
 static void port_close(void)
 {
-    if (s_port == PORT_UART) Serial1.end();
-    if (s_port == PORT_I2C) Wire.end();
-    pinMode(PIN_UMB_0, INPUT);
-    pinMode(PIN_UMB_1, INPUT);
+    port_apply(false, false, CONN_NONE);
+    pinMode(PIN_UMB1_0, INPUT); pinMode(PIN_UMB1_1, INPUT);
+    pinMode(PIN_UMB2_0, INPUT); pinMode(PIN_UMB2_1, INPUT);
     s_port = PORT_OFF;
 }
 
 static void port_open(uint8_t p)
 {
     if (s_port == p) return;
-    port_close();
-    if (p == PORT_UART) {
-        Serial1.setTX(PIN_UMB_0); Serial1.setRX(PIN_UMB_1);
-        Serial1.setFIFOSize(512);
-        Serial1.begin(ZL_UMB_BAUD);
-        zl_rx_init(&s_rx);
-    } else if (p == PORT_I2C) {
-        ariadna_refresh_tx(millis());
-        Wire.setSDA(PIN_UMB_0); Wire.setSCL(PIN_UMB_1);
-        Wire.begin((uint8_t)ARIADNA_RAMPA_I2C_ADDR);
-        Wire.onReceive(on_i2c_receive);
-        Wire.onRequest(on_i2c_request);
+    switch (p) {
+    case PORT_J3_UART:  port_apply(true,  false, CONN_NONE); break;
+    case PORT_J3_I2C:   port_apply(false, false, CONN_J3);   break;
+    case PORT_J14_UART: port_apply(false, true,  CONN_NONE); break;
+    case PORT_J14_I2C:  port_apply(false, false, CONN_J14);  break;
+    case PORT_SCAN_A:   port_apply(true,  false, CONN_J14);  break;   // primary: J3 UART0, J14 I2C0
+    case PORT_SCAN_B:   port_apply(false, true,  CONN_J3);   break;   // alternate: J3 I2C0, J14 UART1
+    default:            port_close(); return;
     }
     s_port = p;
 }
@@ -504,29 +570,35 @@ static void umbilical_service(uint32_t now)
         if (done && (uint32_t)(now - s_detach_ms) > 2000u) {
             s_detached = false;
             s_last_cmd_ms = now;                          // give the rocket time to come back
-            port_open(PORT_I2C);
+            port_open(s_conn == CONN_J14 ? PORT_J14_I2C : PORT_J3_I2C);
         }
         return;
     }
 
-    // ---- locked: keep the port, drop the lock after a long silence ------------
+    // ---- locked: keep the active connector, drop the lock after a long silence --
     if (s_proto != P_NONE) {
-        port_open(s_proto == P_ZENITH ? PORT_UART : PORT_I2C);
+        if (s_proto == P_ZENITH) port_open(s_conn == CONN_J14 ? PORT_J14_UART : PORT_J3_UART);
+        else                     port_open(s_conn == CONN_J14 ? PORT_J14_I2C  : PORT_J3_I2C);
         if ((uint32_t)(now - s_last_cmd_ms) > UNLOCK_MS && !critical_state()) {
             s_proto = P_NONE;
+            s_conn = CONN_NONE;
             s_evt |= EVT_UNLOCK;
             s_scan_slot_ms = now;
         }
         return;
     }
 
-    // ---- scanning --------------------------------------------------------------------
-    if ((uint32_t)(now - s_boot_ms) < BOOT_I2C_MS) { port_open(PORT_I2C); return; }
+    // ---- scanning both J3 and J14 --------------------------------------------
+    // First 1.5 s (UMB_5V OFF): listen for Ariadna on J14 (0..750 ms) then J3 (750..1500 ms).
+    if ((uint32_t)(now - s_boot_ms) < BOOT_I2C_MS) {
+        port_open(((uint32_t)(now - s_boot_ms) < (BOOT_I2C_MS / 2u)) ? PORT_SCAN_A : PORT_SCAN_B);
+        return;
+    }
     if ((uint32_t)(now - s_scan_slot_ms) >= SCAN_SLOT_MS) {
         s_scan_slot_ms = now;
-        port_open(s_port == PORT_I2C ? PORT_UART : PORT_I2C);
-    } else if (s_port == PORT_OFF) {
-        port_open(PORT_I2C);
+        port_open(s_port == PORT_SCAN_A ? PORT_SCAN_B : PORT_SCAN_A);
+    } else if (s_port != PORT_SCAN_A && s_port != PORT_SCAN_B) {
+        port_open(PORT_SCAN_A);
     }
 }
 
@@ -702,6 +774,11 @@ static void outputs_update(uint32_t now)
     if (c != c_last) { s_rgb.setPixelColor(0, s_rgb.Color((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)); s_rgb.show(); c_last = c; }
 }
 
+static const char *conn_name(uint8_t c)
+{
+    return c == CONN_J3 ? "J3" : c == CONN_J14 ? "J14" : "scan";
+}
+
 static void print_events(void)
 {
     noInterrupts();
@@ -710,19 +787,20 @@ static void print_events(void)
     interrupts();
     if (!e) return;
     const unsigned long t = (unsigned long)millis();
-    if (e & EVT_LOCK_Z)   { Serial.println("ROCKET: Zenith (UART 115200)"); if (s_usb_stream) Serial.printf("$EV,%lu,ROCKET: Zenith (UART 115200)\n", t); }
-    if (e & EVT_LOCK_A)   { Serial.println("ROCKET: Daidalos / Ariadna V2 (I2C slave 0x2B)"); if (s_usb_stream) Serial.printf("$EV,%lu,ROCKET: Daidalos / Ariadna V2 (I2C 0x2B)\n", t); }
-    if (e & EVT_UNLOCK)   { Serial.println("ROCKET: none (scanning I2C / UART)"); if (s_usb_stream) Serial.printf("$EV,%lu,ROCKET: none (scanning)\n", t); }
+    const char *cn = conn_name(s_conn);
+    if (e & EVT_LOCK_Z)   { Serial.printf("ROCKET: Zenith on %s (UART 115200)\n", cn); if (s_usb_stream) Serial.printf("$EV,%lu,ROCKET: Zenith on %s (UART 115200)\n", t, cn); }
+    if (e & EVT_LOCK_A)   { Serial.printf("ROCKET: Daidalos / Ariadna V2 on %s (I2C slave 0x2B)\n", cn); if (s_usb_stream) Serial.printf("$EV,%lu,ROCKET: Daidalos / Ariadna V2 on %s (I2C 0x2B)\n", t, cn); }
+    if (e & EVT_UNLOCK)   { Serial.println("ROCKET: none (scanning J3 + J14)"); if (s_usb_stream) Serial.printf("$EV,%lu,ROCKET: none (scanning J3+J14)\n", t); }
     if (e & EVT_ABORT)    { Serial.printf("ABORT faults 0x%02X\n", s_latched | s_faults); if (s_usb_stream) Serial.printf("$EV,%lu,ABORT faults 0x%02X\n", t, s_latched | s_faults); }
     if (e & EVT_COMMIT)   { Serial.printf("COMMITTED, T-%ld ms\n", (long)(int32_t)(s_t0_ms - millis())); if (s_usb_stream) Serial.printf("$EV,%lu,COMMITTED T-%ld ms\n", t, (long)(int32_t)(s_t0_ms - millis())); }
-    if (e & EVT_DETACH)   { Serial.println("Ariadna umbilical detached (GP0/GP1 Hi-Z)"); if (s_usb_stream) Serial.printf("$EV,%lu,Ariadna umbilical detached\n", t); }
+    if (e & EVT_DETACH)   { Serial.printf("Ariadna umbilical %s detached (Hi-Z)\n", cn); if (s_usb_stream) Serial.printf("$EV,%lu,Ariadna umbilical %s detached\n", t, cn); }
     if (e & EVT_FIRE)     { Serial.printf("FIRE channel %u for %u ms\n", s_pyro_ch, s_fire_ms); if (s_usb_stream) Serial.printf("$EV,%lu,FIRE ch %u (%u ms)\n", t, s_pyro_ch, s_fire_ms); }
     if (e & EVT_UMB_TRIP) { Serial.printf("UMB_5V overcurrent %u mA -> rocket supply OFF\n", s_umb_ma); if (s_usb_stream) Serial.printf("$EV,%lu,UMB_5V overcurrent %u mA\n", t, s_umb_ma); }
 }
 
 static void usb_send_status(uint32_t now)
 {
-    if (Serial.availableForWrite() < 160) return;
+    if (Serial.availableForWrite() < 168) return;
     const uint8_t hw_mask = (uint8_t)((s_exp_ok ? 1u : 0u) |
                                       (s_ina_ok ? 2u : 0u) |
                                       (s_ina_umb_ok ? 4u : 0u) |
@@ -733,7 +811,7 @@ static void usb_send_status(uint32_t now)
                                         (digitalRead(PIN_FIRE[2]) ? 4u : 0u));
     const int32_t t_rem = s_cd ? (int32_t)(s_t0_ms - now) : -1;
     const int32_t cmd_age = s_last_cmd_ms ? (int32_t)(now - s_last_cmd_ms) : -1;
-    Serial.printf("$S,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%ld,%u,%u,%u,%ld,%u,%u,%lu,%lu\n",
+    Serial.printf("$S,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%ld,%u,%u,%u,%ld,%u,%u,%lu,%lu,%u\n",
                   (unsigned long)now, (unsigned)s_proto, (unsigned)s_port, (unsigned)s_state,
                   (unsigned)s_flags, (unsigned)(s_faults | s_latched), (unsigned)hw_mask,
                   (unsigned)s_vbat_mv, (unsigned)s_ibat_ma, (unsigned)s_umb_mv, (unsigned)s_umb_ma,
@@ -742,7 +820,7 @@ static void usb_send_status(uint32_t now)
                   s_lora_on ? 1 : 0, s_rocket_pwr ? 1 : 0, s_umb_trip ? 1 : 0, s_locate ? 1 : 0,
                   s_diag ? 1 : 0, s_diag_arm ? 1 : 0, (long)t_rem, (unsigned)s_pyro_ch, (unsigned)s_fire_ms,
                   (unsigned)s_last_seq, (long)cmd_age, (unsigned)s_exp_in, (unsigned)s_exp_out,
-                  (unsigned long)s_lora_tx_cnt, (unsigned long)s_lora_rx_cnt);
+                  (unsigned long)s_lora_tx_cnt, (unsigned long)s_lora_rx_cnt, (unsigned)s_conn);
 }
 
 static bool tok_eq(const char *a, const char *b)
@@ -979,7 +1057,8 @@ void setup()
 {
     pinMode(PIN_PYRO_ARM, OUTPUT); digitalWrite(PIN_PYRO_ARM, LOW);
     for (int i = 0; i < 3; i++) { pinMode(PIN_FIRE[i], OUTPUT); digitalWrite(PIN_FIRE[i], LOW); }
-    pinMode(PIN_UMB_0, INPUT); pinMode(PIN_UMB_1, INPUT);
+    pinMode(PIN_UMB1_0, INPUT); pinMode(PIN_UMB1_1, INPUT);
+    pinMode(PIN_UMB2_0, INPUT); pinMode(PIN_UMB2_1, INPUT);
 
     Serial.begin(115200);
     s_rgb.begin(); s_rgb.setBrightness(80); s_rgb.setPixelColor(0, s_rgb.Color(0, 0, 255)); s_rgb.show();
@@ -994,7 +1073,7 @@ void setup()
     compute_flags();
     s_boot_ms = millis();
     s_scan_slot_ms = s_boot_ms;
-    port_open(PORT_I2C);                 // listen for an Ariadna first, rocket supply OFF
+    port_open(PORT_SCAN_A);              // listen for Ariadna on J14 + Zenith on J3 first, UMB_5V OFF
     watchdog_enable(1000, true);
 }
 
@@ -1008,7 +1087,7 @@ void loop()
     compute_flags();
     interrupts();
 
-    if (s_port == PORT_UART) zenith_poll();
+    zenith_poll();
     umbilical_service(now);
     usb_poll(now);
 
@@ -1064,7 +1143,7 @@ void loop()
         if (!s_fire_end_ms && (uint32_t)(now - s_fired_ms) > POST_FIRE_MS) s_state = ZR_ST_IDLE;
     }
     if (!s_diag && s_state != ZR_ST_FIRED && s_state != ZR_ST_COMMITTED && digitalRead(PIN_PYRO_ARM)) pyro_off();
-    if (s_port == PORT_I2C) ariadna_refresh_tx(now);
+    if (s_i2c_conn != CONN_NONE) ariadna_refresh_tx(now);
     interrupts();
 
     // ---- rocket supply protection ------------------------------------------------
@@ -1098,8 +1177,8 @@ void loop()
     if ((int32_t)(now - t_dbg) >= 0) {
         t_dbg = now + 1000;
         static const char *PN[3] = { "scan", "ZENITH", "ARIADNA" };
-        Serial.printf("RAMPA %s port %u st %u flags 0x%02X faults 0x%02X vbat %u umb %u mA cont %u/%u/%u key %d btn %d lora %d\n",
+        Serial.printf("RAMPA %s port %u st %u flags 0x%02X faults 0x%02X vbat %u umb %u mA cont %u/%u/%u key %d btn %d lora %d conn %s\n",
                       PN[s_proto], s_port, s_state, s_flags, s_faults | s_latched, s_vbat_mv, s_umb_ma,
-                      s_cont_mv[0], s_cont_mv[1], s_cont_mv[2], s_key, s_btn, s_lora_on);
+                      s_cont_mv[0], s_cont_mv[1], s_cont_mv[2], s_key, s_btn, s_lora_on, conn_name(s_conn));
     }
 }

@@ -50,6 +50,8 @@ check(parsed is not None and parsed["c1_mv"] > rp.CONT_MIN_MV, "CH1 continuity p
 leg_line = "RAMPA scan port 2 st 1 flags 0x45 faults 0x00 vbat 7920 umb 140 mA cont 1200/0/0 key 1 btn 0 lora 1"
 leg = rp.parse_legacy_line(leg_line)
 check(leg is not None and leg["legacy"] == 1 and leg["vbat_mv"] == 7920 and leg["c1_mv"] == 1200, "legacy 1 Hz line parsed")
+leg_j14 = rp.parse_legacy_line("RAMPA ARIADNA port 4 st 1 flags 0xAF faults 0x00 vbat 8000 umb 0 mA cont 1200/0/0 key 1 btn 0 lora 0 conn J14")
+check(leg_j14 is not None and leg_j14["conn"] == 2 and leg_j14["proto"] == 2, "legacy 1 Hz line with conn J14 parsed")
 
 i2c_rep = sim.handle_command("I2C SCAN")
 addrs = rp.parse_i2c_scan_line(i2c_rep[0])

@@ -6,12 +6,13 @@ struct TwoWire {
     bool internal = false;
     // slave side
     bool slave_on = false; uint8_t slave_addr = 0;
+    int sda = -1, scl = -1;
     void (*on_rx)(int) = nullptr; void (*on_req)() = nullptr;
     std::deque<uint8_t> srx; std::vector<uint8_t> stx;
     // master side (internal bus)
     uint8_t cur = 0, reg = 0; std::vector<uint8_t> wbuf; std::deque<uint8_t> rbuf;
     explicit TwoWire(bool i) : internal(i) {}
-    void setSDA(int) {} void setSCL(int) {} void setClock(uint32_t) {} void setTimeout(int) {}
+    void setSDA(int p) { sda = p; } void setSCL(int p) { scl = p; } void setClock(uint32_t) {} void setTimeout(int) {}
     void begin() {}
     void begin(uint8_t a) { slave_on = true; slave_addr = a; }
     void end() { slave_on = false; }

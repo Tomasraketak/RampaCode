@@ -57,3 +57,4 @@ struct StubUart {
 };
 extern StubPrint Serial;
 extern StubUart Serial1;
+extern StubUart Serial2;

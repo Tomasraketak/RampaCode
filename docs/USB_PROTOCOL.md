@@ -13,7 +13,7 @@ reálný chod rampy (pokud je USB buffer plný, řádek se zahodí).
 | Řádek | Kdy | Pole |
 |---|---|---|
 | `$ID,Rampa PCB1,<fw>,Zenith+Daidalos` | na `HELLO` | identifikace desky a verze FW (`100` = `1.00`) |
-| `$S,...` | 10 Hz (po `HELLO`/`STREAM 1`) nebo na `STATUS` | `t_ms, proto, port, state, flags, faults, hw_mask, vbat_mv, ibat_ma, umb_mv, umb_ma, v5_mv, c1_mv, c2_mv, c3_mv, key, btn, pyro_arm, fire_mask, lora_on, rocket_pwr, umb_trip, locate, diag, diag_arm, t_rem_ms, pyro_ch, fire_ms, last_seq, cmd_age_ms, exp_in, exp_out, lora_tx, lora_rx` |
+| `$S,...` | 10 Hz (po `HELLO`/`STREAM 1`) nebo na `STATUS` | `t_ms, proto, port, state, flags, faults, hw_mask, vbat_mv, ibat_ma, umb_mv, umb_ma, v5_mv, c1_mv, c2_mv, c3_mv, key, btn, pyro_arm, fire_mask, lora_on, rocket_pwr, umb_trip, locate, diag, diag_arm, t_rem_ms, pyro_ch, fire_ms, last_seq, cmd_age_ms, exp_in, exp_out, lora_tx, lora_rx, conn` |
 | `$I2C,0x20,0x40,...` | na `I2C SCAN` | nalezené 7bitové adresy na interní sběrnici I²C1 (GP6/GP7) |
 | `$EV,t_ms,<text>` | při události (při `STREAM 1`) | události stavového automatu, LoRa a DIAG |
 | `#OK ...` / `#ERR ...` | odpověď na příkaz | potvrzení nebo důvod odmítnutí |
@@ -21,7 +21,8 @@ reálný chod rampy (pokud je USB buffer plný, řádek se zahodí).
 
 Bitové masky:
 - `proto`: `0` scan, `1` Zenith (UART), `2` Daidalos/Ariadna (I²C)
-- `port`: `0` Hi-Z, `1` UART0, `2` I²C0 slave `0x2B`
+- `conn`: `0` scan (`J3` + `J14`), `1` konektor `J3` (`GP0/GP1`), `2` konektor `J14` (`GP8/GP9`)
+- `port`: `0` Hi-Z, `1` `J3` UART0, `2` `J3` I²C0, `3` `J14` UART1, `4` `J14` I²C0, `5` Scan A (`J3` UART0 + `J14` I²C0), `6` Scan B (`J3` I²C0 + `J14` UART1)
 - `state`, `flags`, `faults`: shodné s `zenith_link.h` (`ZR_ST_*`, `ZL_RMP_*`, `ZL_RMPF_*`)
 - `hw_mask`: bit0 `TCA9534 (0x20)`, bit1 `INA226 VBAT (0x40)`, bit2 `INA226 UMB (0x41)`, bit3 `ADS1115 (0x48)`, bit4 `LoRa SX1278`
 - `fire_mask`: bit0–2 aktuálně sepnutý kanál `CH1–CH3` (GP16–GP18)
